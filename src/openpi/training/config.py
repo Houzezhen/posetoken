@@ -86,7 +86,11 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
-    
+
+    # Dataset keys and frame offsets used to sample observation history. Offsets
+    # are relative to the current frame and must be ordered from past to current.
+    observation_history_keys: Sequence[str] = ()
+    observation_history_offsets: Sequence[int] = (0,)
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -384,8 +388,17 @@ class LeRobotPiperDataConfig(DataConfigFactory):
     comments below.
     """
 
+    # Optional history frame offsets (oldest to current, must end with 0).
+    # When longer than (0,), observation state/images are sampled at these
+    # offsets and stacked by PiperInputs.
+    history_offsets: tuple[int, ...] = (0,)
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not self.history_offsets or self.history_offsets[-1] != 0:
+            raise ValueError("Piper history_offsets must end with the current frame offset 0")
+        if tuple(sorted(self.history_offsets)) != self.history_offsets:
+            raise ValueError("Piper history_offsets must be ordered from oldest to current")
         # The repack transform is *only* applied to the data coming from the dataset,
         # and *not* during inference. We can use it to make inputs from the dataset look
         # as close as possible to those coming from the inference environment (e.g. match the keys).
@@ -400,7 +413,8 @@ class LeRobotPiperDataConfig(DataConfigFactory):
                     {
                         "observation/image": "observation.images.primary",
                         "observation/wrist_image": "observation.images.wrist",
-                        "observation/target_image": "observation.images.target",
+                        # 数据集只有 top + wrist 两路图像, 无 target 时注释掉:
+                        # "observation/target_image": "observation.images.target",
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
@@ -416,7 +430,13 @@ class LeRobotPiperDataConfig(DataConfigFactory):
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
         data_transforms = _transforms.Group(
-            inputs=[piper_policy.PiperInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[
+                piper_policy.PiperInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    history_length=len(self.history_offsets),
+                )
+            ],
             outputs=[piper_policy.PiperOutputs()],
         )
 
@@ -448,6 +468,10 @@ class LeRobotPiperDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            observation_history_keys=(
+                piper_policy.PIPER_HISTORY_DATASET_KEYS if len(self.history_offsets) > 1 else ()
+            ),
+            observation_history_offsets=self.history_offsets,
         )
 
 
@@ -992,6 +1016,49 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "/media/Data/user/openpi05_quaternion/checkpoints/pi05_piper_history/button_camera/25000/params"
         ),
+        save_interval=5000,
+        keep_period=10,
+        num_train_steps=30_001,
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+
+    ### pi05 used for PiPER + Pose Token + 历史帧堆叠 -----------------------------------------------
+    # 在 pi05_piper_pose_token 基础上叠加 piperhistory 的时间上下文:
+    #   - 图像 (primary/wrist) 按 PIPER_HISTORY_OFFSETS 采样多帧, 拼成马赛克
+    #   - state 按帧拼接 (当前帧在前), 但 pose token 只编码当前帧 (pose_split 不变)
+    # 需要对应数据集的历史帧统计: python scripts/compute_pose_bin_stats.py --output=./bin_stats/pi05_piper.pkl
+    TrainConfig(
+        name="pi05_piper_pose_history",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            use_pose_state_encoding=True,
+            bin_stats_path="./bin_stats/pi05_piper.pkl",
+            pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/media/Data/user/huggingface/lerobot/TCP/data_toiletButton_0701_quaternion_camframe",
+            history_offsets=piper_policy.PIPER_HISTORY_OFFSETS,
+            base_config=DataConfig(
+                action_sequence_keys=("action",),
+                prompt_from_task=True),
+        ),
+        # 从预训练 checkpoint 恢复 (embedding 会自动扩展, pose 表均值初始化)
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/Data/user/openpi05_quaternion/checkpoints/pi05_piper_history/button_camera/25000/params"
+        ),
+        policy_metadata={
+            "observation_history": {
+                "length": len(piper_policy.PIPER_HISTORY_OFFSETS),
+                "input_specs": piper_policy.PIPER_HISTORY_INPUT_SPECS,
+                "stride_frames": piper_policy.PIPER_HISTORY_STRIDE_FRAMES,
+                "offsets": piper_policy.PIPER_HISTORY_OFFSETS,
+            }
+        },
         save_interval=5000,
         keep_period=10,
         num_train_steps=30_001,

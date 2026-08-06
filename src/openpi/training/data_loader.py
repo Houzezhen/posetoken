@@ -138,12 +138,17 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    # 历史帧堆叠: 对 observation_history_keys 按 observation_history_offsets 采样多帧
+    history_timestamps = [offset / dataset_meta.fps for offset in data_config.observation_history_offsets]
+    for key in data_config.observation_history_keys:
+        if key in delta_timestamps:
+            raise ValueError(f"Dataset key {key!r} is configured for both actions and observation history")
+        delta_timestamps[key] = history_timestamps
+
+    dataset = lerobot_dataset.LeRobotDataset(data_config.repo_id, delta_timestamps=delta_timestamps)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
