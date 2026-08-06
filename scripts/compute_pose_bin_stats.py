@@ -109,28 +109,17 @@ def create_rlds_dataloader(
 
 def detect_stall_segments(
     states: np.ndarray,
-    home_thresh: float | None = None,
-    window: int = 5,
-    speed_dims: int = 3,
     speed_thresh: float = 0.01,
+    window: int = 5,
 ) -> tuple[int, int]:
     """识别一个 episode 的开头/结尾停滞段索引。
 
-    主判据: 帧 XYZ 位置到 home (初始帧) 的欧氏距离。
-      - 距离 < home_thresh 的帧视为 home 附近 (停滞)
-      - 距离 >= home_thresh 的帧视为动作中段
-    这能可靠区分"停滞"和"精细操作":精细操作虽然速度小,但位置远离 home。
-
-    然后从两端向内扫描,找出最长的"开头 home 段"和"结尾 home 段",
-    中间 (即使穿过 home) 都当作动作中段。
+    用滑动窗口平滑帧间欧氏速度,再从两端向内寻找第一个非停滞帧。
 
     Args:
         states: (T, D) 单个 episode 的 state 序列
-        home_thresh: 距 home 的 XYZ 距离阈值,小于此值视为停滞。
-            None = 自动取 max(0.5, 全程最大距离 * 5%) 作为自适应阈值
-        window: 滑动窗口大小(帧),用于平滑"是否在 home 附近"避免单帧抖动
-        speed_dims: 用于位置/速度计算的维度数(默认前 3 维 = XYZ 平移)
-        speed_thresh: 速度阈值 (兜底用,当 home 距离无法区分时退化到速度判断)
+        speed_thresh: 速度阈值,小于此值视为停滞
+        window: 滑动窗口大小(帧),用于平滑速度避免抖动误判
 
     Returns:
         (start, end): 动作中段 [start, end),开头 [0,start) 与结尾 [end,T) 为停滞段
@@ -139,24 +128,18 @@ def detect_stall_segments(
     if T < 3:
         return 0, T
 
-    # 只用前 speed_dims 维 (默认 XYZ) 判断位置
-    xyz = states[:, :speed_dims]
-    home = xyz[0]
-    dist_to_home = np.linalg.norm(xyz - home, axis=1)  # (T,)
+    # 帧间欧氏速度
+    diffs = np.diff(states, axis=0, prepend=states[:1])
+    speeds = np.linalg.norm(diffs, axis=1)  # (T,)
 
-    # 自适应阈值: 取整个 episode 最大距离的一个比例
-    if home_thresh is None:
-        max_dist = float(dist_to_home.max())
-        home_thresh = max(0.5, max_dist * 0.05)
-
-    # "是否在 home 附近"的逐帧布尔序列,用滑动窗口多数投票平滑
-    near_home = (dist_to_home < home_thresh).astype(np.float32)
+    # 滑动窗口平均,抑制单帧抖动
     if window > 1:
         kernel = np.ones(window) / window
-        smooth = np.convolve(near_home, kernel, mode="same")
-        is_stall = smooth >= 0.6  # 窗口内 >=60% 帧在 home 附近才算停滞
+        smooth = np.convolve(speeds, kernel, mode="same")
     else:
-        is_stall = near_home > 0.5
+        smooth = speeds
+
+    is_stall = smooth < speed_thresh
 
     # 从开头向右找第一个非停滞帧
     start = 0
@@ -167,26 +150,10 @@ def detect_stall_segments(
     while end > start and is_stall[end - 1]:
         end -= 1
 
-    # 兜底 1: 中段至少保留 50%,防止极端情况全部判为停滞
+    # 兜底:中段至少保留 50%,防止极端情况全部判为停滞
     min_mid = T // 2
     if end - start < min_mid:
-        # 退化方案: 用速度阈值再试一次
-        diffs = np.diff(xyz, axis=0, prepend=xyz[:1])
-        speeds = np.linalg.norm(diffs, axis=1)
-        if window > 1:
-            sp_smooth = np.convolve(speeds, np.ones(window) / window, mode="same")
-        else:
-            sp_smooth = speeds
-        is_stall2 = sp_smooth < speed_thresh
-        start = 0
-        while start < T and is_stall2[start]:
-            start += 1
-        end = T
-        while end > start and is_stall2[end - 1]:
-            end -= 1
-
-    # 兜底 2: 仍然太短就用前后固定比例
-    if end - start < min_mid:
+        # 退化方案: 用前后各 10% 作为停滞段
         start = max(1, T // 10)
         end = T - max(1, T // 20)
         if end <= start:
@@ -199,77 +166,64 @@ def compute_segmented_percentiles(
     mid_values: np.ndarray,
     n_bins: int = 2048,
     stall_bin_ratio: float = 0.1,
-    min_gap: float = 1e-6,
 ) -> np.ndarray:
-    """加权百分位分桶: 通过重复采样让中段在统计中占更大权重,自动去重死桶。
+    """分段计算分桶边界: 停滞段占少数桶,中段占多数桶。
 
-    停滞段和动作中段的数值范围通常会重叠 (机器人在动作过程中会经过 home 位置附近),
-    因此不能分段独立计算边界再拼接 (会导致拼接处不单调)。
-
-    策略:
-      1. 用加权采样合并数据: mid_values 重复 N 次 (N 由 stall_bin_ratio 反推),
-         使中段数据密度更高,从而在百分位分桶时获得更多更窄的桶。
-      2. 用合并后的数据计算 n_bins+1 个百分位边界 (天然单调)。
-      3. 停滞段在 home 位置有大量相同值,会产生大量零宽"死桶"。
-         用 min_gap 合并相邻过近的边界,得到真正有效的桶 (可能 < n_bins)。
+    两段各自用百分位法计算内部边界,然后拼接,保证每段内部仍有非均匀分辨率。
 
     Args:
         stall_values: 停滞段的数值
         mid_values: 动作中段的数值
-        n_bins: 总桶数上限
-        stall_bin_ratio: 停滞段数据占总数据的期望比例 (0~1),越小则 mid 段分辨率越高
-        min_gap: 相邻边界的最小允许间距,小于此值会被合并去重 (float32 精度友好)
+        n_bins: 总桶数
+        stall_bin_ratio: 分配给停滞段的桶数比例 (0~1)
 
     Returns:
-        (M+1,) 严格递增的分桶边界, M <= n_bins
+        (n_bins+1,) 分桶边界
     """
     n_bins = int(n_bins)
-    stall_values = np.asarray(stall_values, dtype=np.float64).ravel()
-    mid_values = np.asarray(mid_values, dtype=np.float64).ravel()
+    n_stall_bins = max(1, int(n_bins * stall_bin_ratio))
+    n_mid_bins = max(1, n_bins - n_stall_bins)
 
-    # 处理某一段为空的退化情况
-    if len(stall_values) == 0 and len(mid_values) == 0:
-        return np.linspace(0.0, 1.0, n_bins + 1, dtype=np.float32)
-    if len(stall_values) == 0:
-        values = mid_values
-    elif len(mid_values) == 0:
-        values = stall_values
-    else:
-        # 反推 mid 段的重复倍数:
-        # 目标: stall 占总数据的 stall_bin_ratio
-        #   len(stall) / (len(stall) + k*len(mid)) = stall_bin_ratio
-        #   => k = len(stall)*(1-r) / (r*len(mid))
-        r = max(1e-4, min(0.999, stall_bin_ratio))
-        k = (len(stall_values) * (1.0 - r)) / (r * len(mid_values))
-        # 至少重复 1 次,上限 50 防止内存爆炸
-        k = max(1.0, min(50.0, k))
-        n_repeat = max(1, int(round(k)))
-        values = np.concatenate(
-            [stall_values, np.repeat(mid_values, n_repeat)]
-        )
+    def _pct(vals: np.ndarray, nb: int) -> np.ndarray:
+        if len(vals) == 0:
+            return np.array([])
+        p = np.percentile(vals, np.linspace(0, 100, nb + 1))
+        for i in range(1, len(p)):
+            if p[i] <= p[i - 1]:
+                p[i] = p[i - 1] + 1e-10
+        return p.astype(np.float32)
 
-    # 用合并后的数据计算百分位边界 (天然单调非递减)
-    percentiles = np.percentile(values, np.linspace(0, 100, n_bins + 1))
+    p_stall = _pct(stall_values, n_stall_bins)
+    p_mid = _pct(mid_values, n_mid_bins)
 
-    # 合并过近/重复的边界 (解决 home 位置死桶问题)
-    # 保留第一个边界,后续边界必须比上一个至少大 min_gap
-    out = [percentiles[0]]
-    for v in percentiles[1:]:
-        if v - out[-1] >= min_gap:
-            out.append(v)
-        # 否则丢弃 (与上一个边界太近,合并为一个桶)
-    # 如果去重后只剩 1 个点 (所有值相同),添加一个微小偏移作为第二边界
-    if len(out) == 1:
-        out.append(out[0] + max(min_gap, abs(out[0]) * 1e-6))
+    if len(p_stall) == 0:
+        # 无停滞数据,直接用中段(补齐到 n_bins+1)
+        out = p_mid
+        if len(out) < n_bins + 1:
+            pad = np.full(n_bins + 1 - len(out), out[-1], dtype=np.float32)
+            out = np.concatenate([out, pad])
+        return out
+    if len(p_mid) == 0:
+        out = p_stall
+        if len(out) < n_bins + 1:
+            pad = np.full(n_bins + 1 - len(out), out[-1], dtype=np.float32)
+            out = np.concatenate([out, pad])
+        return out
 
-    # 转 float32 后再次去重 (float32 精度可能导致相邻值塌缩为同一个值)
-    arr32 = np.asarray(out, dtype=np.float32)
-    # 用相邻差值 (float32 域内) 做最终去重
-    keep = np.concatenate([[True], np.diff(arr32) > 0])
-    arr32 = arr32[keep]
-    if len(arr32) == 1:
-        arr32 = np.array([arr32[0], np.nextafter(arr32[0], np.inf)], dtype=np.float32)
-    return arr32
+    # 拼接: 去掉中段的第一个点(与停滞段最后一个点重叠或邻近)
+    merged = np.concatenate([p_stall, p_mid[1:]])
+    # 确保总数为 n_bins+1
+    if len(merged) < n_bins + 1:
+        pad = np.full(n_bins + 1 - len(merged), merged[-1], dtype=np.float32)
+        merged = np.concatenate([merged, pad])
+    elif len(merged) > n_bins + 1:
+        merged = merged[: n_bins + 1]
+
+    # 最终严格递增检查
+    for i in range(1, len(merged)):
+        if merged[i] <= merged[i - 1]:
+            merged[i] = merged[i - 1] + 1e-10
+    return merged.astype(np.float32)
 
 
 def main(
@@ -278,10 +232,8 @@ def main(
     max_frames: int | None = None,
     pose_split: str = '{"trans_xyz": [0, 1, 2], "quat_wxyz": [3, 4, 5, 6], "other": []}',
     # === 停滞检测参数 ===
-    home_thresh: float | None = None,
     speed_thresh: float = 0.01,
     smooth_window: int = 5,
-    speed_dims: int = 3,
     trim_head_ratio: float = 0.0,
     trim_tail_ratio: float = 0.0,
     # === 分桶分配参数 ===
@@ -295,23 +247,18 @@ def main(
 ):
     """统计 state 的分桶边界,避开开头/结尾停滞段,密集覆盖动作中段。
 
-    停滞段判据: 帧 XYZ 位置到 home (初始帧) 的欧氏距离 < home_thresh。
-    这能可靠区分"停滞"(在 home 附近)和"精细操作"(远离 home 但速度小)。
-
     Args:
         config_name: 训练配置名称 (如 "pi05_aloha")
         output: 输出 pkl 文件路径
         max_frames: 最大采样帧数 (None 表示全部)
         pose_split: JSON 格式的 state 结构描述
-        home_thresh: 距 home 的 XYZ 距离阈值。None=自适应 max(0.5, max_dist*5%)
-        speed_thresh: 速度阈值 (兜底用,当 home 距离无法区分时退化到速度判断)
-        smooth_window: 平滑窗口 (帧),抑制"是否在 home 附近"的单帧抖动
-        speed_dims: 计算位置/速度的维度数 (默认前 3 维 = XYZ)
+        speed_thresh: 帧间欧氏速度阈值,小于此值视为停滞 (单位与 state 一致)
+        smooth_window: 速度平滑窗口 (帧),抑制抖动
         trim_head_ratio: 额外按时间比例剔除每个 episode 开头的比例 (0=不剔除)
         trim_tail_ratio: 额外按时间比例剔除每个 episode 结尾的比例 (0=不剔除)
-        stall_bin_ratio: 停滞段数据在统计中的期望占比 (0~1),越小则动作中段分辨率越高 (默认 0.1)
-        n_bins: 每个维度分桶数的上限 (实际桶数可能更少,会自动去除零宽死桶)
-        fine_op_speed_max: 精细操作速度上限 (中段里速度低于此值的帧会被加权采样)
+        stall_bin_ratio: 停滞段分配的桶数比例 (0~1),其余给动作中段
+        n_bins: 每个维度的总桶数
+        fine_op_speed_max: 精细操作速度上限 (低速但 > speed_thresh),会被加权采样
         fine_op_weight: 精细操作帧的采样权重倍数
         bin_all_dims: True=对 state 所有维度分别分桶; False=只按 pose_split 的 XYZ 分桶
     """
@@ -407,17 +354,13 @@ def main(
         inner_s = head_trim
         inner_e = T - tail_trim
 
-        # 在 [inner_s, inner_e) 内做停滞检测 (基于 XYZ 位置到 home 的距离)
-        start_rel, end_rel = detect_stall_segments(
-            ep_states[inner_s:inner_e],
-            home_thresh=home_thresh,
-            window=smooth_window,
-            speed_dims=speed_dims,
-            speed_thresh=speed_thresh,
+        # 在 [inner_s, inner_e) 内做速度检测
+        start, end = detect_stall_segments(
+            ep_states[inner_s:inner_e], speed_thresh=speed_thresh, window=smooth_window
         )
         # 转回原 episode 索引
-        start = start_rel + inner_s
-        end = end_rel + inner_s
+        start += inner_s
+        end += inner_s
 
         # 停滞段: [0, start) + [end, T)
         for d in range(D):
@@ -425,12 +368,10 @@ def main(
             stall_per_dim[d].append(ep_states[end:, d])
         n_stall_frames += start + (T - end)
 
-        # 中段: [start, end),对其中精细操作帧 (XYZ 速度小) 加权采样
-        # 这里用 XYZ 速度识别精细操作:它们远离 home 但运动缓慢,需要更高分辨率
+        # 中段: [start, end),精细操作加权
         mid_states = ep_states[start:end]
         if len(mid_states) > 1:
-            mid_xyz = mid_states[:, :speed_dims]
-            diffs = np.diff(mid_xyz, axis=0, prepend=mid_xyz[:1])
+            diffs = np.diff(mid_states, axis=0, prepend=mid_states[:1])
             speeds = np.linalg.norm(diffs, axis=1)
             fine_mask = (speeds > speed_thresh) & (speeds < fine_op_speed_max)
             for d in range(D):
@@ -485,10 +426,8 @@ def main(
         "dims_to_bin": dims_to_bin,
         "n_bins": n_bins,
         "config": {
-            "home_thresh": home_thresh,
             "speed_thresh": speed_thresh,
             "smooth_window": smooth_window,
-            "speed_dims": speed_dims,
             "stall_bin_ratio": stall_bin_ratio,
             "fine_op_speed_max": fine_op_speed_max,
             "fine_op_weight": fine_op_weight,
