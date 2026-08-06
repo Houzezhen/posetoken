@@ -71,12 +71,16 @@ class Pi0(_model.BaseModel):
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
         # ===== Pose Token: 计算扩展后的 vocab_size =====
-        # 启用 pose state encoding 时, 词表需要扩展以容纳新增的 pose token
+        # 启用 pose state encoding 时, 词表需要扩展以容纳新增的 pose token。
+        # 基础词表保持 PALIGEMMA_VOCAB_SIZE, pose token 走独立 embedding 表,
+        # 这样 LoRA freeze_filter 冻结 gemma 时 pose 表仍可训练。
         extended_vocab_size = _gemma.PALIGEMMA_VOCAB_SIZE
+        extra_vocab_size = 0
         if getattr(config, "use_pose_state_encoding", False):
             from openpi.models.pose_tokenizer import PoseStateTokenizer
 
             pose_tok = PoseStateTokenizer(config.bin_stats_path)
+            extra_vocab_size = pose_tok.num_special_tokens
             extended_vocab_size = pose_tok.extended_vocab_size
             logger.info(
                 "Pose state encoding enabled: extending vocab_size %d -> %d (+%d tokens)",
@@ -92,7 +96,8 @@ class Pi0(_model.BaseModel):
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
-                vocab_size=extended_vocab_size,
+                vocab_size=_gemma.PALIGEMMA_VOCAB_SIZE,
+                extra_vocab_size=extra_vocab_size,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])

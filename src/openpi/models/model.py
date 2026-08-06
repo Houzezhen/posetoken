@@ -364,6 +364,27 @@ def _maybe_extend_embedding(expected: at.Params, got: at.Params) -> at.Params:
     modified = False
     for k, ref_v in flat_expected.items():
         if k not in flat_got:
+            # ===== Pose Token: 旧 checkpoint 无独立 pose 表 → 用基础 embedding 均值补齐 =====
+            # 拆分方案下 pose_embedding 是新增参数, 预训练 checkpoint 中不存在。
+            # 用同路径 input_embedding 的均值初始化, 保证 check_pytree_equality 通过。
+            k_str = "/".join(str(part) for part in k) if isinstance(k, tuple) else str(k)
+            if (
+                "pose_embedding" in k_str
+                and ref_v.ndim == 2
+            ):
+                base_key = tuple(
+                    "input_embedding" if str(part) == "pose_embedding" else part for part in k
+                )
+                base_v = flat_got.get(base_key)
+                if base_v is not None and base_v.ndim == 2 and base_v.shape[1] == ref_v.shape[1]:
+                    mean_emb = base_v.mean(axis=0, keepdims=True)
+                    flat_got[k] = np.tile(mean_emb, (ref_v.shape[0], 1)).astype(ref_v.dtype)
+                    modified = True
+                    logger.info(
+                        "[load safety net] Initialized missing pose embedding '%s' to (%s, mean init)",
+                        k_str,
+                        ref_v.shape,
+                    )
             continue
         got_v = flat_got[k]
         if (

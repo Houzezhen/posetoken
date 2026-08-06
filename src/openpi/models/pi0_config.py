@@ -118,6 +118,11 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
+            # Pose Token: 新增的 pose embedding 表 (llm/embedder/pose_embedding)
+            # 需要保持可训练, 不随 gemma 基础参数一起被冻结。
+            filters.append(
+                nnx.Not(nnx_utils.PathRegex(".*pose_embedding.*")),
+            )
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)

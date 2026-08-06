@@ -983,14 +983,14 @@ _CONFIGS = [
             pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="/home/user/.cache/huggingface/lerobot/TCP/data_toiletButton_0626_quaternion",
+            repo_id="/media/Data/user/huggingface/lerobot/TCP/data_toiletButton_0701_quaternion_camframe",
             base_config=DataConfig(
                 action_sequence_keys=("action",),
                 prompt_from_task=True),
         ),
         # 从预训练 pi05 checkpoint 恢复 (embedding 会自动扩展)
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/home/user/openpi05_quaternion/checkpoints/data_toiletButton_0626_quaternion_10steps/10000/params"
+            "/media/Data/user/openpi05_quaternion/checkpoints/pi05_piper_history/button_camera/25000/params"
         ),
         save_interval=5000,
         keep_period=10,

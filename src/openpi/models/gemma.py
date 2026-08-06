@@ -137,6 +137,9 @@ class Embedder(nn.Module):
 
     vocab_size: int
     embed_dim: int
+    # 新增 pose token 数, 使用独立的 embedding 表。
+    # 拆分后 LoRA freeze_filter 可只冻结基础表, 而 pose 表保持可训练。
+    extra_vocab_size: int = 0
 
     def setup(self):
         self.input_embedding_table = self.param(
@@ -144,14 +147,34 @@ class Embedder(nn.Module):
             nn.initializers.normal(),
             (self.vocab_size, self.embed_dim),
         )
+        if self.extra_vocab_size > 0:
+            self.pose_embedding_table = self.param(
+                "pose_embedding",
+                nn.initializers.normal(),
+                (self.extra_vocab_size, self.embed_dim),
+            )
 
     def encode(self, x):
-        x = self.input_embedding_table[(x,)]
-        x *= jnp.sqrt(self.embed_dim).astype(x.dtype)
-        return x
+        # x 中可能含 pose token ID (>= vocab_size), 按区间分查两张表
+        if self.extra_vocab_size > 0:
+            is_pose = x >= self.vocab_size
+            base_ids = jnp.clip(x, 0, self.vocab_size - 1)
+            pose_ids = jnp.clip(x - self.vocab_size, 0, self.extra_vocab_size - 1)
+            base_emb = self.input_embedding_table[(base_ids,)]
+            pose_emb = self.pose_embedding_table[(pose_ids,)]
+            emb = jnp.where(is_pose[..., None], pose_emb, base_emb)
+        else:
+            emb = self.input_embedding_table[(x,)]
+        emb *= jnp.sqrt(self.embed_dim).astype(emb.dtype)
+        return emb
 
     def decode(self, x):
-        return jnp.dot(x, self.input_embedding_table.T)
+        # tied lm_head: 拼接基础表与 pose 表, 覆盖完整词表
+        if self.extra_vocab_size > 0:
+            full_table = jnp.concatenate([self.input_embedding_table, self.pose_embedding_table], axis=0)
+        else:
+            full_table = self.input_embedding_table
+        return jnp.dot(x, full_table.T)
 
 
 @at.typecheck
@@ -349,6 +372,8 @@ class Module(nn.Module):
     # 可配置词表大小, 用于支持 Pose Token 扩展。
     # 默认为 None 时使用 PALIGEMMA_VOCAB_SIZE。
     vocab_size: int | None = None
+    # 新增 pose token 数, 拆分为独立 embedding 表 (可单独训练)。
+    extra_vocab_size: int = 0
 
     def setup(self):
         # all experts must have the same depth
@@ -357,6 +382,7 @@ class Module(nn.Module):
         self.embedder = Embedder(
             vocab_size=self.vocab_size if self.vocab_size is not None else PALIGEMMA_VOCAB_SIZE,
             embed_dim=self.configs[0].width,  # embedder for first expert only
+            extra_vocab_size=self.extra_vocab_size,
             name="embedder",
         )
         block_cls = nn.remat(
