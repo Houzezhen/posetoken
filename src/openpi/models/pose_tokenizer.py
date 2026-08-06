@@ -20,10 +20,10 @@ logger = logging.getLogger("openpi")
 # PaliGemma 原始词表大小
 BASE_VOCAB_SIZE = 257152
 
-# 默认 state 结构: [x, y, z, qw, qx, qy, qz]
+# state 结构: [x, y, z, qx, qy, qz, qw]  (xyzw 四元数顺序)
 DEFAULT_POSE_SPLIT = {
     "trans_xyz": [0, 1, 2],
-    "quat_wxyz": [3, 4, 5, 6],
+    "quat_xyzw": [3, 4, 5, 6],
     "other": [],
 }
 
@@ -125,15 +125,24 @@ class PoseStateTokenizer:
             parts.append(self._encode_value(tz, self.percentiles_tz, self.TRANS_Z_TOKENS))
 
         # --- 旋转维度: 四元数 → 欧拉角 → 360 bin ---
-        quat_idx = pose_split.get("quat_wxyz", [])
+        # 支持 xyzw 和 wxyz 两种顺序
+        quat_idx = pose_split.get("quat_xyzw", [])
         if len(quat_idx) >= 4:
-            qw, qx, qy, qz = state[quat_idx[0]], state[quat_idx[1]], state[quat_idx[2]], state[quat_idx[3]]
+            qx, qy, qz, qw = state[quat_idx[0]], state[quat_idx[1]], state[quat_idx[2]], state[quat_idx[3]]
             euler = self._quaternion_to_euler(qw, qx, qy, qz)
-            # [-π, π] → [0, 359]
             rot_bins = ((euler + np.pi) / (2 * np.pi) * 359).astype(int)
             rot_bins = np.clip(rot_bins, 0, 359)
             for b in rot_bins:
                 parts.append(self.ROT_TOKENS[int(b)])
+        else:
+            quat_idx = pose_split.get("quat_wxyz", [])
+            if len(quat_idx) >= 4:
+                qw, qx, qy, qz = state[quat_idx[0]], state[quat_idx[1]], state[quat_idx[2]], state[quat_idx[3]]
+                euler = self._quaternion_to_euler(qw, qx, qy, qz)
+                rot_bins = ((euler + np.pi) / (2 * np.pi) * 359).astype(int)
+                rot_bins = np.clip(rot_bins, 0, 359)
+                for b in rot_bins:
+                    parts.append(self.ROT_TOKENS[int(b)])
 
         # --- 其他维度 (如 gripper) ---
         other_idx = pose_split.get("other", [])

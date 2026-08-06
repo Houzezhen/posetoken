@@ -980,7 +980,7 @@ _CONFIGS = [
             action_horizon=20,
             use_pose_state_encoding=True,
             bin_stats_path="./bin_stats/pi05_piper.pkl",
-            pose_split={"trans_xyz": [0, 1, 2], "quat_wxyz": [3, 4, 5, 6], "other": []},
+            pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
         ),
         data=LeRobotPiperDataConfig(
             repo_id="/home/user/.cache/huggingface/lerobot/TCP/data_toiletButton_0626_quaternion",
