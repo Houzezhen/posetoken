@@ -40,7 +40,17 @@ class PoseStateTokenizer:
     输出 token 字符串: "<transXY1024><transXY0512><transZ0890><rot045><rot090><rot180>"
     """
 
-    def __init__(self, bin_stats_path: str | None = None, base_vocab_size: int = BASE_VOCAB_SIZE):
+    def __init__(
+        self,
+        bin_stats_path: str | None = None,
+        base_vocab_size: int = BASE_VOCAB_SIZE,
+        # 训练数据中 state 经过 Normalize (z-score), 分桶边界与欧拉角都基于原始值,
+        # 因此编码前需用这些统计量反归一化, 恢复原始位姿。None 表示跳过 (原样使用)。
+        state_norm_mean: np.ndarray | None = None,
+        state_norm_std: np.ndarray | None = None,
+        state_norm_q01: np.ndarray | None = None,
+        state_norm_q99: np.ndarray | None = None,
+    ):
         """
         Args:
             bin_stats_path: 预计算的分桶边界 pkl 文件路径。
@@ -48,8 +58,14 @@ class PoseStateTokenizer:
                               - percentiles_txy: (2049,) 平移 XY 分桶边界
                               - percentiles_tz:  (2049,) 平移 Z 分桶边界
             base_vocab_size: PaliGemma 原始词表大小，pose token ID 从此值开始。
+            state_norm_mean/std: 归一化统计量 (z-score), 用于编码前反归一化。
+            state_norm_q01/q99:  归一化统计量 (quantile), 用于编码前反归一化。
         """
         self._base_vocab_size = base_vocab_size
+        self._state_mean = np.asarray(state_norm_mean, dtype=np.float64) if state_norm_mean is not None else None
+        self._state_std = np.asarray(state_norm_std, dtype=np.float64) if state_norm_std is not None else None
+        self._state_q01 = np.asarray(state_norm_q01, dtype=np.float64) if state_norm_q01 is not None else None
+        self._state_q99 = np.asarray(state_norm_q99, dtype=np.float64) if state_norm_q99 is not None else None
 
         # --- 生成 token 字符串列表 ---
         self.TRANS_XY_TOKENS = self._gen_tokens("transXY", 2048)
@@ -114,6 +130,13 @@ class PoseStateTokenizer:
             pose_split = DEFAULT_POSE_SPLIT
 
         state = np.asarray(state, dtype=np.float64).flatten()
+        # 反归一化: 训练/推理时 state 先经过 Normalize, 分桶与欧拉角基于原始值,
+        # 因此先恢复原始位姿再编码。与 Normalize 一致, 统计量按前 N 维切片
+        # (统计量维度 >= state 维度时使用前 state.shape[0] 维)。
+        if self._state_mean is not None and self._state_std is not None and state.shape[0] <= self._state_mean.shape[0]:
+            state = state * (self._state_std[: state.shape[0]] + 1e-6) + self._state_mean[: state.shape[0]]
+        elif self._state_q01 is not None and self._state_q99 is not None and state.shape[0] <= self._state_q01.shape[0]:
+            state = (state + 1.0) / 2.0 * (self._state_q99[: state.shape[0]] - self._state_q01[: state.shape[0]] + 1e-6) + self._state_q01[: state.shape[0]]
         parts = []
 
         # --- 平移维度 ---

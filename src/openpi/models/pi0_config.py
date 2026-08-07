@@ -38,7 +38,8 @@ class Pi0Config(_model.BaseModelConfig):
     # 分桶边界 pkl 文件路径 (由 compute_pose_bin_stats.py 生成)
     bin_stats_path: str | None = None
     # state 结构描述: {"trans_xyz": [0,1,2], "quat_wxyz": [3,4,5,6], "other": []}
-    pose_split: dict | None = None
+    # 用参数化类型, 否则 tyro 解析 config 时无法匹配 dict 默认值
+    pose_split: dict[str, list[int]] | None = None
     # ==============================================
 
     def __post_init__(self):

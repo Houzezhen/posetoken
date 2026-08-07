@@ -239,10 +239,9 @@ class BaseModelConfig(abc.ABC):
 
         # ===== Pose Token: 安全机制 — 处理 embedding shape 不匹配 =====
         # 正常情况下 weight_loader 的 _merge_params 已完成 embedding 扩展。
-        # 此处作为安全网: 若 params 中的 embedding 仍小于 state, 用均值初始化补齐。
-        use_pose_encoding = getattr(self, "use_pose_state_encoding", False)
-        if use_pose_encoding:
-            params = _maybe_extend_embedding(state.to_pure_dict(), params)
+        # 此处作为安全网: 若 params 中缺少 pose_embedding 或 embedding 行数不足,
+        # 用基础表均值初始化补齐。对无 pose token 的模型无副作用。
+        params = _maybe_extend_embedding(state.to_pure_dict(), params)
         # ==============================================================
 
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)

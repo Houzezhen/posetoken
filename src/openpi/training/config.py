@@ -114,6 +114,10 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    # 归一化统计量 (data_config.norm_stats), 用于 pose tokenizer 编码前反归一化 state。
+    norm_stats: dict[str, _transforms.NormStats] | None = None
+    # 归一化方式: True=quantile, False=z-score
+    use_quantile_norm: bool = False
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -137,11 +141,29 @@ class ModelTransformFactory(GroupFactory):
                 if getattr(model_config, "use_pose_state_encoding", False):
                     from openpi.models.pose_tokenizer import PoseStateTokenizer
 
-                    pose_tok = PoseStateTokenizer(model_config.bin_stats_path)
+                    # 归一化统计量: 训练时 state 先归一化再编码, 编码前需反归一化
+                    # 恢复原始位姿 (分桶边界与欧拉角都基于原始值)。
+                    state_stats = (self.norm_stats or {}).get("state")
+                    norm_kwargs = {}
+                    if state_stats is not None:
+                        if self.use_quantile_norm:
+                            norm_kwargs = {
+                                "state_norm_q01": state_stats.q01,
+                                "state_norm_q99": state_stats.q99,
+                            }
+                        else:
+                            norm_kwargs = {
+                                "state_norm_mean": state_stats.mean,
+                                "state_norm_std": state_stats.std,
+                            }
+
+                    pose_tok = PoseStateTokenizer(model_config.bin_stats_path, **norm_kwargs)
                     logging.info(
-                        "Pose state encoding enabled: %d extra tokens, pose_split=%s",
+                        "Pose state encoding enabled: %d extra tokens, pose_split=%s, "
+                        "state_norm=%s",
                         pose_tok.num_special_tokens,
                         pose_split,
+                        "provided" if norm_kwargs else "none (unnormalized input)",
                     )
                 # ======================================
 
@@ -291,10 +313,15 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        base_data_config = self.create_base_config(assets_dirs)
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt,
+            norm_stats=base_data_config.norm_stats,
+            use_quantile_norm=base_data_config.use_quantile_norm,
+        )(model_config)
 
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_data_config,
             repack_transforms=self.repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -460,11 +487,15 @@ class LeRobotPiperDataConfig(DataConfigFactory):
 
         # Model transforms include things like tokenizing the prompt and action targets
         # You do not need to change anything here for your own dataset.
-        model_transforms = ModelTransformFactory()(model_config)
+        base_data_config = self.create_base_config(assets_dirs)
+        model_transforms = ModelTransformFactory(
+            norm_stats=base_data_config.norm_stats,
+            use_quantile_norm=base_data_config.use_quantile_norm,
+        )(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
-            self.create_base_config(assets_dirs),
+            base_data_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -1003,7 +1034,7 @@ _CONFIGS = [
             pi05=True,
             action_horizon=20,
             use_pose_state_encoding=True,
-            bin_stats_path="./bin_stats/pi05_piper.pkl",
+            bin_stats_path="./bin_stats.pkl",
             pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
         ),
         data=LeRobotPiperDataConfig(
@@ -1037,7 +1068,7 @@ _CONFIGS = [
             pi05=True,
             action_horizon=20,
             use_pose_state_encoding=True,
-            bin_stats_path="./bin_stats/pi05_piper.pkl",
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats.pkl",
             pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
         ),
         data=LeRobotPiperDataConfig(

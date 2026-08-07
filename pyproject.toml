@@ -24,6 +24,9 @@ dependencies = [
     "opencv-python>=4.10.0.84",
     "openpi-client",
     "orbax-checkpoint==0.11.13",
+    # pyarrow 20.x 内嵌 jemalloc 的 background_thread 在大内存机器上会段错误
+    # (SIGSEGV in background_thread_entry from libarrow.so), 锁定 19.x 规避.
+    "pyarrow>=19.0.1,<20",
     "pillow>=11.0.0",
     "sentencepiece>=0.2.0",
     "torch==2.7.1",
