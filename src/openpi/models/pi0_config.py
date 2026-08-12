@@ -42,14 +42,44 @@ class Pi0Config(_model.BaseModelConfig):
     pose_split: dict[str, list[int]] | None = None
     # ==============================================
 
+    # ===== DCT 频域分词配置 (pose_token_dct 分支) =====
+    # 启用频域分词: 对 state 时间序列在时间轴做 DCT, 再对系数分桶 (参考 pi0fast)。
+    # 低频系数用 2048-bin 稠密桶, 高频系数用 360-bin 稀疏桶。
+    # 启用后会覆盖 use_pose_state_encoding 的单帧时域编码路径。
+    use_dct_pose_encoding: bool = False
+    # DCT 时间窗口长度 (帧数), 对应密集连续采样帧数。
+    # 当 dct_state_window > 0 时, 与数据 pipeline 取的连续帧数一致,
+    # 不再依赖 PIPER_HISTORY_OFFSETS 的稀疏采样。
+    dct_window_size: int = 4
+    # 密集连续采样帧数 (用于 DCT 频域分析)。设为 0 表示沿用旧行为:
+    # 从 history 堆叠里取 dct_window_size 帧 (稀疏, 不推荐用于频域)。
+    # 设为 > 0 时, 数据 pipeline 会额外取连续 N 帧 state 专门给 DCT。
+    dct_state_window: int = 0
+    # 低频系数个数 (前 n_low_freq 个系数用稠密桶, 其余用稀疏桶)。
+    # None 表示取 ceil(window/2)
+    dct_n_low_freq: int | None = None
+    # 单帧 state 的实际维度 (不含 pad_to_dim 的 padding)。
+    # 例: PIPER_HISTORY_STATE_DIM = 7 (xyz + quat_xyzw)。
+    # 当 state 经过 PadStatesAndActions 填充到 action_dim 时, DCT tokenizer 用此值
+    # 从填充后的向量中取出前 history*dct_state_dim 个值重塑为 (history, dct_state_dim)。
+    dct_state_dim: int = 7
+    # ==================================================
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
 
+        # 启用 DCT 频域分词时, 强制 discrete_state_input=True 并增大 max_token_len
+        if self.use_dct_pose_encoding:
+            object.__setattr__(self, "discrete_state_input", True)
+            # DCT token 数估算: window * (|XY| + |Z| + |Q|) 个系数; 前缀 + 后缀约 30 token
+            # 取一个较宽松的上界, 避免频繁截断告警
+            if self.max_token_len < 300:
+                object.__setattr__(self, "max_token_len", 300)
         # 启用 Pose Token 编码时, 强制 discrete_state_input=True 并增大 max_token_len
-        if self.use_pose_state_encoding:
+        elif self.use_pose_state_encoding:
             object.__setattr__(self, "discrete_state_input", True)
             if self.max_token_len < 300:
                 object.__setattr__(self, "max_token_len", 300)

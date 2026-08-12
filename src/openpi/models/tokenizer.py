@@ -12,49 +12,68 @@ import openpi.shared.download as download
 
 
 class PaligemmaTokenizer:
-    def __init__(self, max_len: int = 48, pose_tokenizer=None, pose_split: dict | None = None):
+    def __init__(
+        self,
+        max_len: int = 48,
+        pose_tokenizer=None,
+        pose_split: dict | None = None,
+        dct_tokenizer=None,
+        dct_state_dim: int = 7,
+    ):
         """
         Args:
             max_len: 最大 token 长度
             pose_tokenizer: 可选的 PoseStateTokenizer 实例。若提供, 则 state 使用
                            PoseVLA 风格的非均匀分桶 + 欧拉角编码, 而非原生 256-bin 均匀分桶。
             pose_split: state 结构描述 {"trans_xyz": [0,1,2], "quat_wxyz": [3,4,5,6], "other": []}
+            dct_tokenizer: 可选的 PoseDCTTokenizer 实例 (pose_token_dct 分支)。
+                          若提供, 优先于 pose_tokenizer, 对 state 时间序列做 DCT 频域分桶。
+            dct_state_dim: DCT 编码时单帧 state 维度 (默认 7), 用于把一维堆叠重塑为 (T, D)。
         """
         self._max_len = max_len
         self._pose_tokenizer = pose_tokenizer
         self._pose_split = pose_split
+        self._dct_tokenizer = dct_tokenizer
+        self._dct_state_dim = int(dct_state_dim)
 
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def tokenize(
+        self,
+        prompt: str,
+        state: np.ndarray | None = None,
+        *,
+        state_dct: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
-        if state is not None:
-            if self._pose_tokenizer is not None:
-                # ===== Pose Token 编码路径 =====
-                # 1. 编码 "Task: {prompt}, State: " (SentencePiece)
-                prefix_str = f"Task: {cleaned_text}, State: "
-                prefix_tokens = self._tokenizer.encode(prefix_str, add_bos=True)
-
-                # 2. 编码 pose token (绕过 SentencePiece, 直接映射为 > base_vocab_size 的 ID)
-                state_token_str = self._pose_tokenizer.encode_state(state, self._pose_split)
-                pose_tokens = self._pose_tokenizer.encode_to_ids(state_token_str)
-
-                # 3. 编码 ";\nAction: " (SentencePiece)
-                suffix_tokens = self._tokenizer.encode(";\nAction: ")
-
-                tokens = prefix_tokens + pose_tokens + suffix_tokens
-            else:
-                # ===== 原生 π0.5 逻辑 (保留兼容) =====
-                # This is the Pi05 format, where the state is part of the discrete language input.
-                discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-                state_str = " ".join(map(str, discretized_state))
-                full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
-                tokens = self._tokenizer.encode(full_prompt, add_bos=True)
+        # DCT 只接受显式传入的密集连续序列 (state_dct); 没有 state_dct 时
+        # 绝不把主干拼接 state 误当序列做 DCT
+        if state_dct is not None and self._dct_tokenizer is not None:
+            # ===== DCT 频域 Pose Token 编码路径 =====
+            prefix_str = f"Task: {cleaned_text}, State: "
+            prefix_tokens = self._tokenizer.encode(prefix_str, add_bos=True)
+            state_token_str = self._dct_tokenizer.encode_state(state_dct, self._pose_split)
+            pose_tokens = self._dct_tokenizer.encode_to_ids(state_token_str)
+            suffix_tokens = self._tokenizer.encode(";\nAction: ")
+            tokens = prefix_tokens + pose_tokens + suffix_tokens
+        elif state is not None and self._pose_tokenizer is not None:
+            # ===== Pose Token 编码路径 (时域单帧) =====
+            prefix_str = f"Task: {cleaned_text}, State: "
+            prefix_tokens = self._tokenizer.encode(prefix_str, add_bos=True)
+            state_token_str = self._pose_tokenizer.encode_state(state, self._pose_split)
+            pose_tokens = self._pose_tokenizer.encode_to_ids(state_token_str)
+            suffix_tokens = self._tokenizer.encode(";\nAction: ")
+            tokens = prefix_tokens + pose_tokens + suffix_tokens
+        elif state is not None:
+            # ===== 原生 π0.5 逻辑 (保留兼容) =====
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
-            # tokenize "\n" separately as the "start of answer" token
             tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
         tokens_len = len(tokens)
         if tokens_len < self._max_len:

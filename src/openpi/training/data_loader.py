@@ -141,9 +141,29 @@ def create_torch_dataset(
     delta_timestamps = {
         key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
     }
+
+    # DCT 密集 state 采样: 启用后 observation.state 取连续 N 帧 (供频域分析),
+    # 与稀疏的 observation_history_offsets 解耦。N 需覆盖两点:
+    #   (1) 主干按 observation_history_offsets 下采样所需的最早帧 (-min(offsets))
+    #   (2) DCT 频域窗口 (dct_state_window)
+    # 注意同一 column 只能配一条 delta_timestamps, 因此 DCT 启用时把
+    # observation.state 从稀疏 history 里移除, 改由 PiperInputs 从 dense 序列
+    # 下采样派生出主干用的稀疏 state (语义不变)。
+    dct_state_keys = set(data_config.dct_state_keys)
+    if dct_state_keys:
+        offsets = data_config.observation_history_offsets
+        state_frames = max(-min(offsets) + 1 if offsets else 0, data_config.dct_state_window)
+        dense_ts = [-(i) / dataset_meta.fps for i in range(state_frames - 1, -1, -1)]
+        for key in dct_state_keys:
+            if key in delta_timestamps:
+                raise ValueError(f"Dataset key {key!r} is configured for both actions and DCT state window")
+            delta_timestamps[key] = dense_ts
+
     # 历史帧堆叠: 对 observation_history_keys 按 observation_history_offsets 采样多帧
     history_timestamps = [offset / dataset_meta.fps for offset in data_config.observation_history_offsets]
     for key in data_config.observation_history_keys:
+        if key in dct_state_keys:
+            continue  # 已由 dense DCT 采样覆盖, PiperInputs 会从 dense 派生稀疏 state
         if key in delta_timestamps:
             raise ValueError(f"Dataset key {key!r} is configured for both actions and observation history")
         delta_timestamps[key] = history_timestamps

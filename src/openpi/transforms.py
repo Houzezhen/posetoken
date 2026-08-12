@@ -253,8 +253,12 @@ class TokenizePrompt(DataTransformFn):
         if (prompt := data.pop("prompt", None)) is None:
             raise ValueError("Prompt is required")
 
+        # state_dct (可选): PiperInputs 提供的密集连续 state 序列, 专门给 DCT tokenizer。
+        # 如果存在, 优先用它做频域编码; 否则回退到单帧 state (兼容老路径)。
+        state_dct = data.pop("state_dct", None)
+
         if self.discrete_state_input:
-            if (state := data.get("state", None)) is None:
+            if (state := data.get("state", None)) is None and state_dct is None:
                 raise ValueError("State is required.")
         else:
             state = None
@@ -262,7 +266,7 @@ class TokenizePrompt(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        tokens, token_masks = self.tokenizer.tokenize(prompt, state, state_dct=state_dct)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 

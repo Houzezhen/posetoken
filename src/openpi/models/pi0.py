@@ -76,7 +76,24 @@ class Pi0(_model.BaseModel):
         # 这样 LoRA freeze_filter 冻结 gemma 时 pose 表仍可训练。
         extended_vocab_size = _gemma.PALIGEMMA_VOCAB_SIZE
         extra_vocab_size = 0
-        if getattr(config, "use_pose_state_encoding", False):
+        if getattr(config, "use_dct_pose_encoding", False):
+            from openpi.models.pose_tokenizer import PoseDCTTokenizer
+
+            pose_tok = PoseDCTTokenizer(
+                config.bin_stats_path,
+                dct_window_size=config.dct_window_size,
+                n_low_freq=config.dct_n_low_freq,
+                state_dim=config.dct_state_dim,
+            )
+            extra_vocab_size = pose_tok.num_special_tokens
+            extended_vocab_size = pose_tok.extended_vocab_size
+            logger.info(
+                "DCT pose encoding enabled: extending vocab_size %d -> %d (+%d tokens)",
+                _gemma.PALIGEMMA_VOCAB_SIZE,
+                extended_vocab_size,
+                pose_tok.num_special_tokens,
+            )
+        elif getattr(config, "use_pose_state_encoding", False):
             from openpi.models.pose_tokenizer import PoseStateTokenizer
 
             pose_tok = PoseStateTokenizer(config.bin_stats_path)

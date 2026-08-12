@@ -92,6 +92,14 @@ class DataConfig:
     observation_history_keys: Sequence[str] = ()
     observation_history_offsets: Sequence[int] = (0,)
 
+    # Dense continuous state window for DCT frequency analysis. When non-empty,
+    # the data loader will sample `dct_state_window` consecutive frames from the
+    # dataset for each key in `dct_state_keys` (relative to current frame, from
+    # -(dct_state_window-1) to 0). These are *separate* from
+    # observation_history_keys so that dense sampling does not affect images.
+    dct_state_keys: Sequence[str] = ()
+    dct_state_window: int = 0
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -135,27 +143,52 @@ class ModelTransformFactory(GroupFactory):
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
 
-                # ===== 条件创建 PoseStateTokenizer =====
-                pose_tok = None
                 pose_split = getattr(model_config, "pose_split", None)
-                if getattr(model_config, "use_pose_state_encoding", False):
-                    from openpi.models.pose_tokenizer import PoseStateTokenizer
 
-                    # 归一化统计量: 训练时 state 先归一化再编码, 编码前需反归一化
-                    # 恢复原始位姿 (分桶边界与欧拉角都基于原始值)。
-                    state_stats = (self.norm_stats or {}).get("state")
-                    norm_kwargs = {}
-                    if state_stats is not None:
-                        if self.use_quantile_norm:
-                            norm_kwargs = {
-                                "state_norm_q01": state_stats.q01,
-                                "state_norm_q99": state_stats.q99,
-                            }
-                        else:
-                            norm_kwargs = {
-                                "state_norm_mean": state_stats.mean,
-                                "state_norm_std": state_stats.std,
-                            }
+                # ===== 归一化统计量 (DCT 和 Pose Token 共用) =====
+                state_stats = (self.norm_stats or {}).get("state")
+                norm_kwargs = {}
+                if state_stats is not None:
+                    if self.use_quantile_norm:
+                        norm_kwargs = {
+                            "state_norm_q01": state_stats.q01,
+                            "state_norm_q99": state_stats.q99,
+                        }
+                    else:
+                        norm_kwargs = {
+                            "state_norm_mean": state_stats.mean,
+                            "state_norm_std": state_stats.std,
+                        }
+                # =====================================================
+
+                # ===== 条件创建 PoseDCTTokenizer (频域, 优先) =====
+                dct_tok = None
+                if getattr(model_config, "use_dct_pose_encoding", False):
+                    from openpi.models.pose_tokenizer import PoseDCTTokenizer
+
+                    dct_tok = PoseDCTTokenizer(
+                        model_config.bin_stats_path,
+                        dct_window_size=model_config.dct_window_size,
+                        n_low_freq=model_config.dct_n_low_freq,
+                        state_dim=model_config.dct_state_dim,
+                        **norm_kwargs,
+                    )
+                    logging.info(
+                        "DCT pose encoding enabled: %d extra tokens, window=%d, n_low=%d, state_dim=%d, "
+                        "pose_split=%s, state_norm=%s",
+                        dct_tok.num_special_tokens,
+                        model_config.dct_window_size,
+                        model_config.dct_n_low_freq,
+                        model_config.dct_state_dim,
+                        pose_split,
+                        "provided" if norm_kwargs else "none (unnormalized input)",
+                    )
+                # ====================================================
+
+                # ===== 条件创建 PoseStateTokenizer (时域, 回退) =====
+                pose_tok = None
+                if dct_tok is None and getattr(model_config, "use_pose_state_encoding", False):
+                    from openpi.models.pose_tokenizer import PoseStateTokenizer
 
                     pose_tok = PoseStateTokenizer(model_config.bin_stats_path, **norm_kwargs)
                     logging.info(
@@ -176,6 +209,8 @@ class ModelTransformFactory(GroupFactory):
                                 model_config.max_token_len,
                                 pose_tokenizer=pose_tok,
                                 pose_split=pose_split,
+                                dct_tokenizer=dct_tok,
+                                dct_state_dim=model_config.dct_state_dim,
                             ),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
@@ -462,6 +497,8 @@ class LeRobotPiperDataConfig(DataConfigFactory):
                     action_dim=model_config.action_dim,
                     model_type=model_config.model_type,
                     history_length=len(self.history_offsets),
+                    history_offsets=self.history_offsets,
+                    dct_state_window=int(getattr(model_config, "dct_state_window", 0) or 0),
                 )
             ],
             outputs=[piper_policy.PiperOutputs()],
@@ -493,6 +530,13 @@ class LeRobotPiperDataConfig(DataConfigFactory):
             use_quantile_norm=base_data_config.use_quantile_norm,
         )(model_config)
 
+        # If the model uses DCT pose encoding with a dedicated dense window,
+        # the data loader samples `dct_state_window` consecutive frames of state.
+        dct_state_window = int(getattr(model_config, "dct_state_window", 0) or 0)
+        dct_state_keys: tuple[str, ...] = ()
+        if dct_state_window > 0 and getattr(model_config, "use_dct_pose_encoding", False):
+            dct_state_keys = ("observation.state",)
+
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
             base_data_config,
@@ -503,6 +547,8 @@ class LeRobotPiperDataConfig(DataConfigFactory):
                 piper_policy.PIPER_HISTORY_DATASET_KEYS if len(self.history_offsets) > 1 else ()
             ),
             observation_history_offsets=self.history_offsets,
+            dct_state_keys=dct_state_keys,
+            dct_state_window=dct_state_window,
         )
 
 
@@ -1101,7 +1147,59 @@ _CONFIGS = [
     ),
     # ========================================================================================================
 
-    
+    ### pi05 used for PiPER + DCT 频域 Pose Token -----------------------------------------------
+    # pose_token_dct 分支: 把 state 时间序列转频域再分词, 参考 pi0fast 思路。
+    #   - 对最近 20 帧密集连续 state 在时间轴做 DCT (不再用稀疏 history 采样)
+    #   - 低频系数 (整体趋势) → 2048-bin 稠密桶
+    #   - 高频系数 (细节抖动) → 360-bin 稀疏桶
+    # 需先运行: python scripts/compute_pose_dct_bin_stats.py \
+    #     --data-dir=./data --output=./bin_stats_dct.pkl --window 20 --n-low-freq 2
+    TrainConfig(
+        name="pi05_piper_pose_dct",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            use_dct_pose_encoding=True,
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct.pkl",
+            pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
+            # DCT 窗口 = 密集连续采样帧数 (不再绑定 PIPER_HISTORY_OFFSETS 的稀疏采样)。
+            # 数据 pipeline 对 observation.state 取 dense 序列 (覆盖 history_offsets
+            # 最早帧 + DCT 窗口), PiperInputs 从 deque 按 offsets 下采样出主干稀疏
+            # state (2 秒跨度语义不变), DCT 取最近 dct_window_size 帧。
+            dct_window_size=20,
+            dct_state_window=20,
+            dct_n_low_freq=2,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="/media/Data/user/huggingface/lerobot/TCP/data_toiletButton_0701_quaternion_camframe",
+            #repo_id="/home/user/.cache/huggingface/lerobot/TCP/data_toiletButton_0812_quaternion_camframe",
+            history_offsets=piper_policy.PIPER_HISTORY_OFFSETS,
+            base_config=DataConfig(
+                action_sequence_keys=("action",),
+                prompt_from_task=True),
+        ),
+        # 从预训练 checkpoint 恢复 (embedding 会自动扩展, pose 表均值初始化)
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/Data/user/openpi05_quaternion/checkpoints/pi05_piper_history/button_camera/25000/params"
+        ),
+        policy_metadata={
+            "observation_history": {
+                "length": len(piper_policy.PIPER_HISTORY_OFFSETS),
+                "input_specs": piper_policy.PIPER_HISTORY_INPUT_SPECS,
+                "stride_frames": piper_policy.PIPER_HISTORY_STRIDE_FRAMES,
+                "offsets": piper_policy.PIPER_HISTORY_OFFSETS,
+            }
+        },
+        save_interval=5000,
+        keep_period=10,
+        num_train_steps=30_001,
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # ============================================================================================
 
     #
     # Fine-tuning Aloha configs.

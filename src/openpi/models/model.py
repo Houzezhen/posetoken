@@ -253,7 +253,9 @@ class BaseModelConfig(abc.ABC):
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
 
         # ===== Pose Token: 支持从预训练 checkpoint 恢复 (embedding 扩展场景) =====
-        use_pose_encoding = getattr(train_config.model, "use_pose_state_encoding", False)
+        use_pose_encoding = getattr(train_config.model, "use_pose_state_encoding", False) or getattr(
+            train_config.model, "use_dct_pose_encoding", False
+        )
         if use_pose_encoding and model._num_extra_tokens > 0:
             # 扩展后的 embedding 矩阵与旧 checkpoint 不兼容
             # 使用 safe_load 逐键加载, 跳过形状不匹配的 embedding 权重

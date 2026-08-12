@@ -85,6 +85,21 @@ class PiperInputs(transforms.DataTransformFn):
     # policy. A value of 1 preserves the original single-observation behavior.
     history_length: int = 1
 
+    # Frame offsets (relative to the current frame, in data frames) used to
+    # sample the sparse history states for the main network. E.g. (-60,-40,-20,0)
+    # gives about two seconds of context at 30 Hz. Kept in sync with
+    # PIPER_HISTORY_OFFSETS. When dct_state_window > 0 these offsets are applied
+    # on top of the dense state deque, so the backbone keeps its original
+    # temporal span while DCT gets a dense window.
+    history_offsets: tuple[int, ...] = ()
+
+    # DCT 频域分析窗口 (密集连续帧数)。> 0 时, state 的 deque 容量扩展到
+    # max(-min(history_offsets)+1, dct_state_window, history_length),
+    # 主干按 history_offsets 下采样 (保持 2 秒跨度语义), DCT 取最近
+    # dct_state_window 帧做频域变换。推理时 client 每帧都发 state,
+    # deque 自然累积密集序列。
+    dct_state_window: int = 0
+
     _history_buffers: dict[str, deque[np.ndarray]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -92,28 +107,53 @@ class PiperInputs(transforms.DataTransformFn):
     def __post_init__(self) -> None:
         if self.history_length < 1:
             raise ValueError("history_length must be at least 1")
+        if self.history_offsets and len(self.history_offsets) != self.history_length:
+            raise ValueError(
+                f"history_offsets ({len(self.history_offsets)}) must match history_length ({self.history_length})"
+            )
 
     def reset(self) -> None:
         self._history_buffers.clear()
 
     def _history(self, key: str, value: np.ndarray, base_ndim: int) -> list[np.ndarray]:
         value = np.asarray(value)
+        # state deque 容量: 需容纳 history_offsets 覆盖的帧 (含 2 秒跨度) + DCT 密集窗口。
+        # DCT 未启用时 (dct_state_window=0) 保持原行为, 数据集直接给稀疏堆叠帧。
+        is_state = key == "observation/state"
+        offsets_span = (-min(self.history_offsets) + 1) if (is_state and self.history_offsets and self.dct_state_window > 0) else 0
+        buf_size = max(self.history_length, self.dct_state_window, offsets_span) if is_state else self.history_length
         if value.ndim == base_ndim + 1:
-            if value.shape[0] != self.history_length:
+            # 训练时数据集堆叠的帧数: DCT 启用时 state 允许 = buf_size (覆盖 offsets + DCT 窗口);
+            # 其他 key (image 等) 必须等于 history_length
+            expected = buf_size if (is_state and self.dct_state_window > 0) else self.history_length
+            if value.shape[0] != expected:
                 raise ValueError(
-                    f"{key} has {value.shape[0]} history frames, expected {self.history_length}"
+                    f"{key} has {value.shape[0]} history frames, expected {expected}"
                 )
             frames = [np.asarray(frame) for frame in value]
-            self._history_buffers[key] = deque((frame.copy() for frame in frames), maxlen=self.history_length)
-            return frames
+            self._history_buffers[key] = deque((frame.copy() for frame in frames), maxlen=buf_size)
+            if is_state and self.history_offsets and self.dct_state_window > 0:
+                # 按 offsets 下采样主干帧 (offset 0 = 最后一帧 = 当前帧)
+                return [frames[-1 + off] for off in self.history_offsets]
+            return frames[-self.history_length:] if is_state and len(frames) > self.history_length else frames
         if value.ndim != base_ndim:
             raise ValueError(
                 f"{key} must have {base_ndim} dimensions, or {base_ndim + 1} with history; got {value.shape}"
             )
 
-        buffer = self._history_buffers.setdefault(key, deque(maxlen=self.history_length))
+        buffer = self._history_buffers.setdefault(key, deque(maxlen=buf_size))
         buffer.append(value.copy())
         frames = list(buffer)
+        if is_state and self.history_offsets and self.dct_state_window > 0:
+            # 推理: 按 offsets 相对 deque 末尾索引, 不足时用首帧补齐
+            result = []
+            for off in self.history_offsets:
+                idx = len(frames) - 1 + off
+                result.append(frames[idx] if idx >= 0 else frames[0])
+            return result
+        # 主干只取最近 history_length 帧 (从旧到新); 多余帧保留在 deque 供 DCT 使用
+        if is_state and len(frames) > self.history_length:
+            frames = frames[-self.history_length :]
         return [frames[0]] * (self.history_length - len(frames)) + frames
 
     def __call__(self, data: dict) -> dict:
@@ -141,6 +181,18 @@ class PiperInputs(transforms.DataTransformFn):
                 f"Flattened state history has {state.shape[0]} values, exceeding action_dim={self.action_dim}"
             )
         state = transforms.pad_to_dim(state, self.action_dim)
+
+        # ===== DCT: 从 state deque 取最近 dct_state_window 帧做频域分析 =====
+        # state_history 已通过 _history 把当前帧 append 进 deque 并返回最近
+        # history_length 帧。这里从同一个 deque 取最近 dct_state_window 帧
+        # (deque 容量已扩展, 见 _history 改动)。主干 state 不受影响。
+        state_dct = None
+        if self.dct_state_window > 0:
+            state_buffer = self._history_buffers.get("observation/state")
+            if state_buffer is not None:
+                # 取 deque 里最近 N 帧 (从旧到新), 不够 N 帧时 tokenizer 内部首帧补齐
+                recent = list(state_buffer)[-self.dct_state_window :]
+                state_dct = np.stack([np.ravel(f)[:PIPER_HISTORY_STATE_DIM] for f in recent])
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference.
@@ -185,6 +237,9 @@ class PiperInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": right_wrist_mask,
             },
         }
+        # 把 DCT 密集 state 序列透传给后续的 TokenizePrompt (可选字段)
+        if state_dct is not None:
+            inputs["state_dct"] = state_dct
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.

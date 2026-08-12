@@ -100,7 +100,25 @@ class PI0Pytorch(nn.Module):
         # ===== Pose Token: 扩展 embedding 矩阵 =====
         self.pose_tokenizer = None
         self._num_extra_tokens = 0
-        if getattr(config, "use_pose_state_encoding", False):
+        if getattr(config, "use_dct_pose_encoding", False):
+            from openpi.models.pose_tokenizer import PoseDCTTokenizer
+
+            self.pose_tokenizer = PoseDCTTokenizer(
+                config.bin_stats_path,
+                dct_window_size=config.dct_window_size,
+                n_low_freq=config.dct_n_low_freq,
+                state_dim=config.dct_state_dim,
+            )
+            self._num_extra_tokens = self.pose_tokenizer.num_special_tokens
+            self._extend_embeddings()
+            logging.info(
+                "Extended embedding (DCT): %d → %d (+%d pose tokens)",
+                self.paligemma_with_expert.paligemma.language_model.model.embed_tokens.num_embeddings
+                - self._num_extra_tokens,
+                self.paligemma_with_expert.paligemma.language_model.model.embed_tokens.num_embeddings,
+                self._num_extra_tokens,
+            )
+        elif getattr(config, "use_pose_state_encoding", False):
             from openpi.models.pose_tokenizer import PoseStateTokenizer
 
             self.pose_tokenizer = PoseStateTokenizer(config.bin_stats_path)

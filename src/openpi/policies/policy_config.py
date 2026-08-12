@@ -54,7 +54,10 @@ def create_trained_policy(
         model = train_config.model.load_pytorch(train_config, weight_path)
 
         # ===== Pose Token: 推理时也需要扩展 embedding =====
-        if getattr(train_config.model, "use_pose_state_encoding", False) and model._num_extra_tokens > 0:
+        if (
+            getattr(train_config.model, "use_pose_state_encoding", False)
+            or getattr(train_config.model, "use_dct_pose_encoding", False)
+        ) and model._num_extra_tokens > 0:
             # embedding 已在 load_pytorch 中扩展 (或从扩展后的 checkpoint 加载)
             logging.info(
                 "Pose token encoding enabled at inference: %d extra tokens",
