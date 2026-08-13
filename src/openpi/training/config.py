@@ -1160,7 +1160,7 @@ _CONFIGS = [
             pi05=True,
             action_horizon=30,
             use_dct_pose_encoding=True,
-            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct.pkl",
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct_w20.pkl",
             pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
             # DCT 窗口 = 密集连续采样帧数 (不再绑定 PIPER_HISTORY_OFFSETS 的稀疏采样)。
             # 数据 pipeline 对 observation.state 取 dense 序列 (覆盖 history_offsets

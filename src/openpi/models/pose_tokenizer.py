@@ -367,8 +367,10 @@ class PoseDCTTokenizer:
     def _denormalize(self, state: np.ndarray) -> np.ndarray:
         """反归一化: 与 PoseStateTokenizer 一致的 z-score / quantile 反归一化。
 
-        支持历史帧堆叠: norm_stats 可能是 (T*D,) 的向量 (per-frame 统计量),
-        本函数逐帧应用对应的 mean/std。
+        支持两种统计量布局:
+          - per-frame 统计量 (T*D,): 训练时对堆叠历史帧逐帧统计, 逐帧切片应用
+          - 单帧统计量 (D,): 普通归一化统计量, 广播应用到每一帧
+        统计量长度不足 D 时跳过该帧的反归一化。
 
         Args:
             state: (T, D) 已归一化的 state
@@ -376,15 +378,26 @@ class PoseDCTTokenizer:
             (T, D) 原始位姿
         """
         T, D = state.shape
+
+        def _denorm_frame(t: int, params: np.ndarray) -> np.ndarray | None:
+            n = params.shape[0]
+            if n >= T * D:
+                # per-frame 统计量: 逐帧切片
+                return params[t * D : t * D + D]
+            if n >= D:
+                # 单帧统计量: 广播到所有帧
+                return params[:D]
+            return None  # 统计量不足, 跳过
+
         # --- z-score 反归一化 ---
         if self._state_mean is not None and self._state_std is not None:
             mean = np.asarray(self._state_mean, dtype=np.float64).reshape(-1)
             std = np.asarray(self._state_std, dtype=np.float64).reshape(-1)
             out = state.copy()
             for t in range(T):
-                m = mean[t * D : t * D + D]
-                s = std[t * D : t * D + D]
-                if np.all(np.abs(s) > 1e-12):      # 统计量有效 (非 padding)
+                m = _denorm_frame(t, mean)
+                s = _denorm_frame(t, std)
+                if m is not None and s is not None and np.all(np.abs(s) > 1e-12):
                     out[t] = state[t] * (s + 1e-6) + m
             return out
         # --- quantile 反归一化 ---
@@ -393,9 +406,9 @@ class PoseDCTTokenizer:
             q99 = np.asarray(self._state_q99, dtype=np.float64).reshape(-1)
             out = state.copy()
             for t in range(T):
-                lo = q01[t * D : t * D + D]
-                hi = q99[t * D : t * D + D]
-                if np.all(np.abs(hi - lo) > 1e-12):
+                lo = _denorm_frame(t, q01)
+                hi = _denorm_frame(t, q99)
+                if lo is not None and hi is not None and np.all(np.abs(hi - lo) > 1e-12):
                     out[t] = (state[t] + 1.0) / 2.0 * (hi - lo + 1e-6) + lo
             return out
         return state
