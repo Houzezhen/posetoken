@@ -170,15 +170,21 @@ class ModelTransformFactory(GroupFactory):
                         model_config.bin_stats_path,
                         dct_window_size=model_config.dct_window_size,
                         n_low_freq=model_config.dct_n_low_freq,
+                        n_keep_coeffs=model_config.dct_n_keep_coeffs,
+                        low_freq_bins=model_config.dct_low_bins,
+                        high_freq_bins=model_config.dct_high_bins,
                         state_dim=model_config.dct_state_dim,
                         **norm_kwargs,
                     )
                     logging.info(
-                        "DCT pose encoding enabled: %d extra tokens, window=%d, n_low=%d, state_dim=%d, "
-                        "pose_split=%s, state_norm=%s",
+                        "DCT pose encoding enabled: %d extra tokens, window=%d, n_low=%d, n_keep=%d, "
+                        "low_bins=%d, high_bins=%d, state_dim=%d, pose_split=%s, state_norm=%s",
                         dct_tok.num_special_tokens,
                         model_config.dct_window_size,
                         model_config.dct_n_low_freq,
+                        model_config.dct_n_keep_coeffs,
+                        model_config.dct_low_bins,
+                        model_config.dct_high_bins,
                         model_config.dct_state_dim,
                         pose_split,
                         "provided" if norm_kwargs else "none (unnormalized input)",
@@ -454,6 +460,12 @@ class LeRobotPiperDataConfig(DataConfigFactory):
     # When longer than (0,), observation state/images are sampled at these
     # offsets and stacked by PiperInputs.
     history_offsets: tuple[int, ...] = (0,)
+    # 是否给 state 主干拼接历史帧 (透传给 PiperInputs.state_history)。默认 True 保持
+    # Piper 行为; 设 False 时 state 主干只取当前帧, history_offsets 仅用于图像 history。
+    state_history: bool = True
+    # 是否给图像拼接历史帧 (透传给 PiperInputs.image_history)。设 False 时数据加载器
+    # 不对图像列做稀疏 history 采样 (省 IO), 图像只用当前帧 —— 用于消融实验。
+    image_history: bool = True
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -499,6 +511,8 @@ class LeRobotPiperDataConfig(DataConfigFactory):
                     history_length=len(self.history_offsets),
                     history_offsets=self.history_offsets,
                     dct_state_window=int(getattr(model_config, "dct_state_window", 0) or 0),
+                    state_history=self.state_history,
+                    image_history=self.image_history,
                 )
             ],
             outputs=[piper_policy.PiperOutputs()],
@@ -549,6 +563,56 @@ class LeRobotPiperDataConfig(DataConfigFactory):
             observation_history_offsets=self.history_offsets,
             dct_state_keys=dct_state_keys,
             dct_state_window=dct_state_window,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRealmanDataConfig(LeRobotPiperDataConfig):
+    """Realman ECO63F 数据集 (liftseat): cam_bottom 为主视角, cam_wrist 为腕部。
+    cam_top 不参与训练。位姿为相机系 7 维绝对位姿 (无 delta)。"""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        config = super().create(assets_dirs, model_config)
+        repack = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.cam_bottom",
+                        "observation/wrist_image": "observation.images.cam_wrist",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        # 7 维 (xyz + quat) 全部启用 delta action: 替换父类 (6+gripper) 的 mask 为 7 维全 delta
+        delta_action_mask = _transforms.make_bool_mask(7)
+        data_transforms = _transforms.Group(
+            inputs=[
+                t if not isinstance(t, _transforms.DeltaActions) else _transforms.DeltaActions(delta_action_mask)
+                for t in config.data_transforms.inputs
+            ],
+            outputs=[
+                t if not isinstance(t, _transforms.AbsoluteActions) else _transforms.AbsoluteActions(delta_action_mask)
+                for t in config.data_transforms.outputs
+            ],
+        )
+        # Realman 数据集图像 key 为 cam_bottom/cam_wrist (非 Piper 的 primary/wrist),
+        # history 堆叠必须用 Realman 自有 dataset key, 否则数据加载器找不到列而报错。
+        # image_history=False 时不采样图像 history (消融: 图像单帧)。
+        if len(self.history_offsets) > 1:
+            history_keys = ("observation.state",)
+            if self.image_history:
+                history_keys += ("observation.images.cam_bottom", "observation.images.cam_wrist")
+        else:
+            history_keys = ()
+        return dataclasses.replace(
+            config,
+            repack_transforms=repack,
+            data_transforms=data_transforms,
+            observation_history_keys=history_keys,
         )
 
 
@@ -1148,27 +1212,31 @@ _CONFIGS = [
     # ========================================================================================================
 
     ### pi05 used for PiPER + DCT 频域 Pose Token -----------------------------------------------
-    # pose_token_dct 分支: 把 state 时间序列转频域再分词, 参考 pi0fast 思路。
-    #   - 对最近 20 帧密集连续 state 在时间轴做 DCT (不再用稀疏 history 采样)
-    #   - 低频系数 (整体趋势) → 2048-bin 稠密桶
-    #   - 高频系数 (细节抖动) → 360-bin 稀疏桶
+    # pose_token_dct 分支: 对 state 时间序列中平移维度 (xyz) 做 DCT 频域分桶。
+    #   - 对最近 30 帧密集连续 state 的 xyz 在时间轴做 DCT, 只保留前 8 个系数
+    #     (低频 k=0,1 → 256-bin 稠密桶; 高频 k=2..7 → 64-bin 稀疏桶)
+    #   - 旋转 (四元数) 退回时域: 逐帧转欧拉角, 均匀分桶 360 bin (参考 pose_token 分支)
     # 需先运行: python scripts/compute_pose_dct_bin_stats.py \
-    #     --data-dir=./data --output=./bin_stats_dct.pkl --window 20 --n-low-freq 2
+    #     --data-dir=./data --output=./bin_stats_dct.pkl --window 30 \
+    #     --n-low-freq 2 --n-keep-coeffs 8 --low-bins 256 --high-bins 64
     TrainConfig(
         name="pi05_piper_pose_dct",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=30,
             use_dct_pose_encoding=True,
-            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct_w20.pkl",
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct_w30.pkl",
             pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
             # DCT 窗口 = 密集连续采样帧数 (不再绑定 PIPER_HISTORY_OFFSETS 的稀疏采样)。
             # 数据 pipeline 对 observation.state 取 dense 序列 (覆盖 history_offsets
             # 最早帧 + DCT 窗口), PiperInputs 从 deque 按 offsets 下采样出主干稀疏
             # state (2 秒跨度语义不变), DCT 取最近 dct_window_size 帧。
-            dct_window_size=20,
-            dct_state_window=20,
+            dct_window_size=30,
+            dct_state_window=30,
             dct_n_low_freq=2,
+            dct_n_keep_coeffs=8,
+            dct_low_bins=256,
+            dct_high_bins=64,
         ),
         data=LeRobotPiperDataConfig(
             repo_id="/media/Data/user/huggingface/lerobot/TCP/data_toiletButton_0701_quaternion_camframe",
@@ -1201,10 +1269,201 @@ _CONFIGS = [
     ),
     # ============================================================================================
 
+    ### pi05 used for Realman ECO63F + DCT 频域 Pose Token (相机系, 无 history) -----------------
+    # 数据集: 拖动示教 liftseat, state/action 为眼在手外手眼矩阵转到相机坐标系的
+    # 法兰位姿 7 维 [x,y,z,qw,qx,qy,qz] (scripts/convert_pose_to_camframe.py 生成)。
+    #   - 无 history: history_offsets=(0,), 单帧观测
+    #   - DCT 取最近 30 帧密集连续 state 的 xyz (由数据 pipeline 对 state 取 dense 序列提供)
+    # 分桶统计: python scripts/compute_pose_dct_bin_stats.py \
+    #   --data-dir=.../liftseat_0819_0820_merged_v2.1_cut_camframe/data \
+    #   --output=./bin_stats_dct_realman.pkl --window 30 \
+    #   --n-low-freq 2 --n-keep-coeffs 8 --low-bins 256 --high-bins 64
+    TrainConfig(
+        name="pi05_realman_pose_dct",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            use_dct_pose_encoding=True,
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct_realman.pkl",
+            pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
+            dct_window_size=30,
+            dct_state_window=30,
+            dct_n_low_freq=2,
+            dct_n_keep_coeffs=8,
+            dct_low_bins=256,
+            dct_high_bins=64,
+        ),
+        data=LeRobotRealmanDataConfig(
+            repo_id="/media/Data/user/datasets/realman/pushbutton_0825_merge_cut_camframe",
+            history_offsets=(0,),
+            base_config=DataConfig(
+                action_sequence_keys=("action",),
+                prompt_from_task=True),
+        ),
+        # 从预训练 checkpoint 恢复 (embedding 会自动扩展, pose 表均值初始化)
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/user/openpi05_quaternion/checkpoints/pi05_piper_history/button_camera/25000/params"
+        ),
+        save_interval=5000,
+        keep_period=10,
+        num_train_steps=30_001,
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # ============================================================================================
+
+    ### pi05 used for Realman ECO63F + DCT 频域 Pose Token (相机系, liftseat 任务) --------------
+    # 数据集: 拖动示教 liftseat (相机系 7 维位姿, delta action)。
+    # 分桶统计在 liftseat 数据集上重新计算:
+    #   python scripts/compute_pose_dct_bin_stats.py \
+    #     --data-dir=/media/Data/user/datasets/realman/liftseat_0819_0820_merged_v2.1_cut_camframe/data \
+    #     --output=./bin_stats_dct_realman_liftseat.pkl --window 30 \
+    #     --n-low-freq 2 --n-keep-coeffs 8 --low-bins 256 --high-bins 64
+    TrainConfig(
+        name="pi05_realman_pose_dct_liftseat",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            use_dct_pose_encoding=True,
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct_realman_liftseat.pkl",
+            pose_split={"trans_xyz": [0, 1, 2], "quat_xyzw": [3, 4, 5, 6], "other": []},
+            dct_window_size=30,
+            dct_state_window=30,
+            dct_n_low_freq=2,
+            dct_n_keep_coeffs=8,
+            dct_low_bins=256,
+            dct_high_bins=64,
+        ),
+        data=LeRobotRealmanDataConfig(
+            repo_id="/media/Data/user/datasets/realman/liftseat_0819_0820_merged_v2.1_cut_camframe",
+            history_offsets=(0,),
+            base_config=DataConfig(
+                action_sequence_keys=("action",),
+                prompt_from_task=True),
+        ),
+        # 从预训练 checkpoint 恢复 (embedding 会自动扩展, pose 表均值初始化)
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/media/user/openpi05_quaternion/checkpoints/pi05_piper_history/button_camera/25000/params"
+        ),
+        save_interval=5000,
+        keep_period=10,
+        num_train_steps=30_001,
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # ============================================================================================
+
+    ### pi05 used for Realman ECO63F + DCT 频域 Pose Token (相机系, 图像 history 拼接) --------------
+    # 与 pi05_realman_pose_dct 的区别: 只加图像 history (4 帧 mosaic); state 主干保持
+    # 单帧 (state_history=False), DCT 频域编码与单帧版完全一致 (state 不改)。
+    #   - 图像 history 拼接: history_offsets=PIPER_HISTORY_OFFSETS (-60,-40,-20,0),
+    #     PiperInputs 把 4 帧拼成 mosaic; 数据集图像 key 为 cam_bottom/cam_wrist
+    #     (LeRobotRealmanDataConfig 已覆写 observation_history_keys, 否则数据加载器
+    #     会因找不到 observation.images.primary 而报错)
+    #   - state: 主干单帧 (state_history=False, 仅当前帧); DCT 另取最近 30 帧密集 xyz
+    # 参考: pi05_piper_pose_dct (Piper + DCT, state 主干多帧; 本配置与之区别即 state 单帧)
+    TrainConfig(
+        name="pi05_realman_pose_dct_history",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            use_dct_pose_encoding=True,
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct_realman.pkl",
+            pose_split={"trans_xyz": [0, 1, 2], "": [3, 4, 5, 6], "other": []},
+            dct_window_size=30,
+            dct_state_window=30,
+            dct_n_low_freq=2,
+            dct_n_keep_coeffs=8,
+            dct_low_bins=256,
+            dct_high_bins=64,
+        ),
+        data=LeRobotRealmanDataConfig(
+            repo_id="/media/Data/user/datasets/realman/pushbutton_0825_merge_cut_camframe",
+            history_offsets=piper_policy.PIPER_HISTORY_OFFSETS,
+            # 只加图像 history: state 主干保持单帧 (与单帧版一致), 不拼历史帧
+            state_history=False,
+            base_config=DataConfig(
+                action_sequence_keys=("action",),
+                prompt_from_task=True),
+        ),
+        # 从预训练 checkpoint 恢复 (embedding 会自动扩展, pose 表均值初始化)
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/user/pi05_poseToken/checkpoints/pi05_realman_pose_dct/realman_dct_camframe_delta_button/10000/params"
+        ),
+        # 图像 history 拼接: 复用 Piper 的 offsets/stride/input_specs (Realman 数据集
+        # 图像 key 在 LeRobotRealmanDataConfig 内映射为 cam_bottom/cam_wrist)。
+        policy_metadata={
+            "observation_history": {
+                "length": len(piper_policy.PIPER_HISTORY_OFFSETS),
+                "input_specs": piper_policy.PIPER_HISTORY_INPUT_SPECS,
+                "stride_frames": piper_policy.PIPER_HISTORY_STRIDE_FRAMES,
+                "offsets": piper_policy.PIPER_HISTORY_OFFSETS,
+            }
+        },
+        save_interval=3000,
+        keep_period=10,
+        num_train_steps=12_001,
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+
+    ### pi05 Realman ECO63F + DCT + state history (消融: 图像单帧) -----------------------------
+    # 与 pi05_realman_pose_dct_history 的区别: state 主干拼 4 帧历史 (state_history=True),
+    # 图像只用当前帧 (image_history=False)。DCT 频域编码与单帧版一致 (最近 30 帧密集 xyz)。
+    # 消融对照:
+    #   - pi05_realman_pose_dct            : state 单帧 + 图像单帧 + DCT
+    #   - pi05_realman_pose_dct_history    : state 单帧 + 图像 4 帧 mosaic + DCT
+    #   - pi05_realman_pose_dct_statehist  : state 4 帧 (2 秒跨度) + 图像单帧 + DCT  <- 本配置
+    TrainConfig(
+        name="pi05_realman_pose_dct_statehist",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            use_dct_pose_encoding=True,
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats_dct_realman.pkl",
+            pose_split={"trans_xyz": [0, 1, 2], "quat_wxyz": [3, 4, 5, 6], "other": []},
+            dct_window_size=30,
+            dct_state_window=30,
+            dct_n_low_freq=2,
+            dct_n_keep_coeffs=8,
+            dct_low_bins=256,
+            dct_high_bins=64,
+        ),
+        data=LeRobotRealmanDataConfig(
+            repo_id="/media/Data/user/datasets/realman/pushbutton_0825_merge_cut_camframe",
+            history_offsets=piper_policy.PIPER_HISTORY_OFFSETS,
+            # state 主干按 offsets 下采样拼接 4 帧; 图像只用当前帧 (消融开关)
+            state_history=True,
+            image_history=False,
+            base_config=DataConfig(
+                action_sequence_keys=("action",),
+                prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/user/pi05_poseToken/checkpoints/pi05_realman_pose_dct_statehist/realman_dct_camframe_delta_button/3000/params"
+        ),
+        save_interval=5000,
+        keep_period=10,
+        num_train_steps=15_001,
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # ============================================================================================
+
     #
-    # Fine-tuning Aloha configs.
-    #
-    # This is a test config that is used to illustate how train on a custom LeRobot dataset.
+    # This is a test config that is used to illustate how to train on a custom LeRobot dataset.
     # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
     TrainConfig(
         name="pi0_aloha_pen_uncap",

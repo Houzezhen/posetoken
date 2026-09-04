@@ -238,43 +238,45 @@ class PoseStateTokenizer:
 class PoseDCTTokenizer:
     """频域 Pose Token 编码器 (pose_token_dct 分支)。
 
-    参考 pi0fast 的思路, 把信号从时域转到频域再分词:
-        state[T, D]  --quat→euler-->  state'[T, D-1]  --DCT(时间轴)-->  coeffs[T, D-1]  --分桶-->  token IDs
+    平移 (xyz) 沿时间轴做 DCT, 只保留前 n_keep_coeffs 个低频系数再分桶:
+        trans[T, 3]  --DCT(时间轴)-->  coeffs[T, 3]  --取前 n_keep_coeffs-->  --分桶-->  token IDs
 
-    旋转部分先逐帧把四元数 (4 维) 转成欧拉角 [roll, pitch, yaw] (3 维, 弧度),
-    再对欧拉角时序做 DCT —— 与 PoseStateTokenizer 一致, 避免直接对四元数做频域分析。
-    平移维度保持不变。
+    旋转 (四元数) 不适合频域分析 (单位约束/双覆盖/非线性叠加), 退回时域:
+    逐帧把四元数转欧拉角 [roll, pitch, yaw], 均匀分桶 360 bin —— 与
+    PoseStateTokenizer 的 rot 分桶完全一致。
 
-    低频系数承载整体运动趋势 (信息量高), 用稠密的 2048-bin 分桶;
-    高频系数承载细节抖动 (信息量低), 用稀疏的 360-bin 分桶。
-    这与原 PoseStateTokenizer 的 "transXY/transZ 2048 (稠密) + rot 360 (稀疏)"
-    双分布结构保持一致, 同时把信号转到频域。
+    平移分桶结构 (compute_pose_dct_bin_stats.py 生成):
+        - 低频系数 (前 n_low_freq 个, 整体运动趋势) → 256-bin 稠密桶
+        - 高频系数 (第 n_low_freq..n_keep_coeffs 个, 细节)   → 64-bin 稀疏桶
 
-    分桶边界来自 DCT 系数的百分位统计 (compute_pose_dct_bin_stats.py 生成),
-    落在 bin_stats_path 指向的 pkl 文件中。
-
-    编码流程 (以 T=4, 输入 D=7 [xyz + quat_xyzw] 为例):
-        1) state[4,7] 反归一化到原始位姿
-        2) 四元数 → 欧拉角: state[4,7] → state'[4,6]  [x, y, z, roll, pitch, yaw]
-        3) 每个维度 d 沿时间轴做 DCT → coeffs[4,6]
-        4) 前 n_low_freq 个低频系数 → percentiles_low  (2048 bins, 稠密)
-           剩余高频系数             → percentiles_high (360  bins, 稀疏)
-        5) 每个 (dim, freq) 的 bin_idx → 对应 token 字符串 → ID
+    编码流程 (以 T=30, 输入 D=7 [xyz + quat_xyzw] 为例):
+        1) state[30,7] 反归一化到原始位姿
+        2) 平移: 每个 xyz 分量沿时间轴做 DCT → coeffs[30,3]
+           只保留前 8 个系数: k=0,1 → 256 bin; k=2..7 → 64 bin
+           (低频 k=0: 均值/直流; k=1: 基频/整体运动方向)
+        3) 旋转: 逐帧四元数 → 欧拉角, 均匀分桶 360 bin (30 帧 × 3 维 = 90 tokens)
+        4) 每个 (dim, freq) / (frame, euler_dim) 的 bin_idx → 对应 token 字符串 → ID
     """
 
-    # transXY/transZ 各 2048 bin, rot 360 bin; 低频系数用 transXY/transZ, 高频用 rot
-    LOW_FREQ_BINS = 2048
-    HIGH_FREQ_BINS = 360
+    # 平移 DCT 系数: 低频 256 bin (稠密), 高频 64 bin (稀疏); 旋转(欧拉角)均匀 360 bin
+    LOW_FREQ_BINS = 256
+    HIGH_FREQ_BINS = 64
+    ROT_BINS = 360
 
     def __init__(
         self,
         bin_stats_path: str | None = None,
         base_vocab_size: int = BASE_VOCAB_SIZE,
-        # DCT 窗口长度 (时间帧数). 与训练时 history_length 一致。
+        # DCT 窗口长度 (时间帧数). 与训练时 dense state 帧数一致。
         dct_window_size: int = 4,
         # 低频系数数量 (前 n_low_freq 个系数用稠密桶, 其余用稀疏桶)。
         # None 表示用一半 (ceil(window/2))。
         n_low_freq: int | None = None,
+        # 平移维度保留的 DCT 系数个数 (前 n_keep_coeffs 个, 丢弃更高频).
+        n_keep_coeffs: int = 8,
+        # 低频/高频桶数 (与 bin_stats pkl 一致).
+        low_freq_bins: int = LOW_FREQ_BINS,
+        high_freq_bins: int = HIGH_FREQ_BINS,
         state_dim: int = 7,
         # 训练数据中 state 经过 Normalize (z-score), 编码前需反归一化恢复原始位姿。
         state_norm_mean: np.ndarray | None = None,
@@ -285,71 +287,72 @@ class PoseDCTTokenizer:
         """
         Args:
             bin_stats_path: 预计算的 DCT 系数分桶边界 pkl, 包含:
-                              - percentiles_low_xy:  (2049,) 低频 XY 系数边界
-                              - percentiles_low_z:   (2049,) 低频 Z  系数边界
-                              - percentiles_high_xy: (361,)  高频 XY 系数边界
-                              - percentiles_high_z:  (361,)  高频 Z  系数边界
-                              - percentiles_low_q:   (2049,) 低频旋转系数边界
-                              - percentiles_high_q:  (361,)  高频旋转系数边界
+                              - percentiles_low_xy:  (low_bins+1,) 低频 XY 系数边界
+                              - percentiles_low_z:   (low_bins+1,) 低频 Z  系数边界
+                              - percentiles_high_xy: (high_bins+1,) 高频 XY 系数边界
+                              - percentiles_high_z:  (high_bins+1,) 高频 Z  系数边界
+                           旋转 (欧拉角) 用均匀 360 bin, 无需统计.
             base_vocab_size: PaliGemma 原始词表大小, pose token ID 从此值开始。
-            dct_window_size: DCT 时间窗口长度 (帧数), 需与 history_length 一致。
-            n_low_freq:      低频系数个数 (用稠密桶); 其余为高频 (用稀疏桶)。
+            dct_window_size: DCT 时间窗口长度 (帧数), 需与 dense state 帧数一致。
+            n_low_freq:      平移低频系数个数 (用稠密桶); 其余为高频 (用稀疏桶)。
+            n_keep_coeffs:   平移保留的 DCT 系数总数 (前 n_keep_coeffs 个).
+            low_freq_bins:   低频桶数 (默认 256).
+            high_freq_bins:  高频桶数 (默认 64).
             state_dim:       state 维度 (默认 7 = xyz + quat_xyzw)。
             state_norm_*:    归一化统计量, 用于编码前反归一化。
         """
         self._base_vocab_size = base_vocab_size
         self._window = int(dct_window_size)
         self._state_dim = int(state_dim)
+        self._n_keep_coeffs = int(n_keep_coeffs)
+        self._low_bins = int(low_freq_bins)
+        self._high_bins = int(high_freq_bins)
         if n_low_freq is None:
             n_low_freq = max(1, (self._window + 1) // 2)
-        self._n_low_freq = int(min(n_low_freq, self._window))
-        self._n_high_freq = self._window - self._n_low_freq
+        # 低频系数数量不能超过保留的系数总数
+        self._n_low_freq = int(min(n_low_freq, self._n_keep_coeffs))
+        self._n_high_freq = self._n_keep_coeffs - self._n_low_freq
 
         self._state_mean = np.asarray(state_norm_mean, dtype=np.float64) if state_norm_mean is not None else None
         self._state_std = np.asarray(state_norm_std, dtype=np.float64) if state_norm_std is not None else None
         self._state_q01 = np.asarray(state_norm_q01, dtype=np.float64) if state_norm_q01 is not None else None
         self._state_q99 = np.asarray(state_norm_q99, dtype=np.float64) if state_norm_q99 is not None else None
 
-        # --- 生成 token 字符串列表 (复用原 tokenizer 的命名空间) ---
-        # 低频系数: transXY/transZ 2048 bin (稠密); 高频系数: rot 360 bin (稀疏)
-        self.LOW_XY_TOKENS = self._gen_tokens("dctXYlow", self.LOW_FREQ_BINS)
-        self.LOW_Z_TOKENS = self._gen_tokens("dctZlow", self.LOW_FREQ_BINS)
-        self.LOW_Q_TOKENS = self._gen_tokens("dctQlow", self.LOW_FREQ_BINS)
-        self.HIGH_XY_TOKENS = self._gen_tokens("dctXYhigh", self.HIGH_FREQ_BINS)
-        self.HIGH_Z_TOKENS = self._gen_tokens("dctZhigh", self.HIGH_FREQ_BINS)
-        self.HIGH_Q_TOKENS = self._gen_tokens("dctQhigh", self.HIGH_FREQ_BINS)
+        # --- 生成 token 字符串列表 ---
+        # 平移: 低频 256 bin (稠密), 高频 64 bin (稀疏)
+        self.LOW_XY_TOKENS = self._gen_tokens("dctXYlow", self._low_bins)
+        self.LOW_Z_TOKENS = self._gen_tokens("dctZlow", self._low_bins)
+        self.HIGH_XY_TOKENS = self._gen_tokens("dctXYhigh", self._high_bins)
+        self.HIGH_Z_TOKENS = self._gen_tokens("dctZhigh", self._high_bins)
+        # 旋转: 欧拉角均匀 360 bin (与 PoseStateTokenizer 一致)
+        self.ROT_TOKENS = self._gen_tokens("rot", self.ROT_BINS)
 
-        # --- 加载 DCT 系数分桶边界 ---
+        # --- 加载平移 DCT 系数分桶边界 ---
         if bin_stats_path and os.path.exists(bin_stats_path):
             with open(bin_stats_path, "rb") as f:
                 data = pickle.load(f)
             self.pct_low_xy = np.asarray(data["percentiles_low_xy"], dtype=np.float64)
             self.pct_low_z = np.asarray(data["percentiles_low_z"], dtype=np.float64)
-            self.pct_low_q = np.asarray(data["percentiles_low_q"], dtype=np.float64)
             self.pct_high_xy = np.asarray(data["percentiles_high_xy"], dtype=np.float64)
             self.pct_high_z = np.asarray(data["percentiles_high_z"], dtype=np.float64)
-            self.pct_high_q = np.asarray(data["percentiles_high_q"], dtype=np.float64)
             logger.info(
-                "Loaded DCT bin stats from %s (low_xy:%d low_z:%d low_q:%d high_xy:%d high_z:%d high_q:%d bins, "
-                "window=%d, n_low=%d)",
+                "Loaded DCT bin stats from %s (low_xy:%d low_z:%d high_xy:%d high_z:%d bins, "
+                "window=%d, n_low=%d, n_keep=%d)",
                 bin_stats_path,
                 len(self.pct_low_xy) - 1,
                 len(self.pct_low_z) - 1,
-                len(self.pct_low_q) - 1,
                 len(self.pct_high_xy) - 1,
                 len(self.pct_high_z) - 1,
-                len(self.pct_high_q) - 1,
                 self._window,
                 self._n_low_freq,
+                self._n_keep_coeffs,
             )
         else:
             logger.warning("DCT bin stats not found at %s, falling back to uniform bins [-1, 1].", bin_stats_path)
-            self.pct_low_xy = np.linspace(-1, 1, self.LOW_FREQ_BINS + 1, dtype=np.float64)
-            self.pct_low_z = np.linspace(-1, 1, self.LOW_FREQ_BINS + 1, dtype=np.float64)
-            self.pct_low_q = np.linspace(-1, 1, self.LOW_FREQ_BINS + 1, dtype=np.float64)
-            self.pct_high_xy = np.linspace(-1, 1, self.HIGH_FREQ_BINS + 1, dtype=np.float64)
-            self.pct_high_z = np.linspace(-1, 1, self.HIGH_FREQ_BINS + 1, dtype=np.float64)
-            self.pct_high_q = np.linspace(-1, 1, self.HIGH_FREQ_BINS + 1, dtype=np.float64)
+            self.pct_low_xy = np.linspace(-1, 1, self._low_bins + 1, dtype=np.float64)
+            self.pct_low_z = np.linspace(-1, 1, self._low_bins + 1, dtype=np.float64)
+            self.pct_high_xy = np.linspace(-1, 1, self._high_bins + 1, dtype=np.float64)
+            self.pct_high_z = np.linspace(-1, 1, self._high_bins + 1, dtype=np.float64)
 
         # --- 构建 token → ID 映射 (ID 从 base_vocab_size 开始) ---
         all_tokens = self.all_special_tokens
@@ -419,24 +422,36 @@ class PoseDCTTokenizer:
         bin_idx = int(np.clip(bin_idx, 0, len(token_list) - 1))
         return token_list[bin_idx]
 
+    @staticmethod
+    def _quaternion_to_euler(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+        """四元数 [w, x, y, z] → 欧拉角 [roll, pitch, yaw] (弧度, 范围 [-π, π])"""
+        roll = np.arctan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy))
+        pitch = np.arcsin(np.clip(2 * (qw * qy - qz * qx), -1.0, 1.0))
+        yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+        return np.array([roll, pitch, yaw], dtype=np.float64)
+
     def encode_state(self, state: np.ndarray, pose_split: dict | None = None) -> str:
-        """将 state 时间序列编码为 DCT 频域 token 字符串。
+        """将 state 时间序列编码为 pose token 字符串。
+
+        - 平移 (xyz): 沿时间轴做 DCT, 只保留前 n_keep_coeffs 个系数。
+          前 n_low_freq 个 (k=0,1: 均值/基频) → 低频稠密桶;
+          其余 (k=2..n_keep_coeffs-1: 高频细节) → 高频稀疏桶。
+        - 旋转 (四元数): 不走 DCT, 逐帧转欧拉角后均匀分桶 360 bin
+          (与 PoseStateTokenizer.rot 一致)。
 
         Args:
             state: (T, D) 或 (T*D,) 或 (>=T*D,) 历史帧堆叠向量。
                    - (T, D): T 帧 × D 维, 按时间从旧到新排列
                    - (>=T*D,): 一维堆叠 (可能含 padding), 会取前 T*D 个值按 D 重塑为 (T, D),
                             frame-major 顺序 [frame0_d0, ..., frame0_d(D-1), frame1_d0, ...]。
-                            PiperInputs 的输出是 [current(D), t-1(D), ...] 顺序, 与 DCT 无关紧要
-                            (DCT 是正交变换, 时序方向不影响系数分布)。
                    若实际 T < window, 会在时间轴首部重复首帧补齐; 若 T > window, 取最后 window 帧。
             pose_split: 维度划分, 仅用其中的索引决定 XY/Z/Q 分组。
                         若为 None, 使用 DEFAULT_POSE_SPLIT (xyzw 顺序)。
 
         Returns:
             token_str: 拼接的 token 字符串, 形如
-                       "<dctXYlow1024>...<dctZhigh045>...<dctQlow0890>..."
-            token 顺序: 低频 → 高频, 每个频率组内按 dim 顺序 (XY → Z → Q)。
+                       "<dctXYlow0123><dctZlow0456><dctXYhigh007><dctZhigh063>...<rot090><rot180>..."
+            token 顺序: 平移低频 (XY→Z) → 平移高频 (XY→Z) → 旋转 (逐帧 roll/pitch/yaw)。
         """
         if pose_split is None:
             pose_split = DEFAULT_POSE_SPLIT
@@ -485,66 +500,50 @@ class PoseDCTTokenizer:
             q_idx = []
             quat_order = None
 
-        # --- 旋转: 四元数 → 欧拉角 (逐帧), 与 PoseStateTokenizer 一致 ---
-        # 四元数 4 维 → 欧拉角 [roll, pitch, yaw] 3 维 (弧度, [-π, π])
-        # 这样 DCT 作用在欧拉角时序上, 而非四元数分量 (四元数不适合直接频域分析)
+        parts: list[str] = []
+
+        # ===== 平移: 时间轴 DCT (type-II 正变换, orthogonally normalized) =====
+        # 只保留前 n_keep_coeffs 个系数 (更低频), 丢弃更高频细节。
+        trans_dim = len(trans_idx)
+        if trans_dim > 0:
+            trans_state = state[:, [i for i in trans_idx if i < D]]  # (T, n_trans)
+            coeffs = dct(trans_state, type=2, norm="ortho", axis=0)  # (T, n_trans)
+            # 低频系数 (k=0..n_low_freq-1): 256-bin 稠密桶
+            xy_idx_valid = [i for i, _ in enumerate(xy_idx) if i < trans_state.shape[1]]
+            z_idx_valid = [i for i, _ in enumerate(z_idx) if i < trans_state.shape[1]]
+            for grp_idx, pct, tokens in (
+                (xy_idx_valid, self.pct_low_xy, self.LOW_XY_TOKENS),
+                (z_idx_valid, self.pct_low_z, self.LOW_Z_TOKENS),
+            ):
+                for d in grp_idx:
+                    for t in range(self._n_low_freq):
+                        parts.append(self._encode_coeff(coeffs[t, d], pct, tokens))
+            # 高频系数 (k=n_low_freq..n_keep_coeffs-1): 64-bin 稀疏桶
+            if self._n_high_freq > 0:
+                for grp_idx, pct, tokens in (
+                    (xy_idx_valid, self.pct_high_xy, self.HIGH_XY_TOKENS),
+                    (z_idx_valid, self.pct_high_z, self.HIGH_Z_TOKENS),
+                ):
+                    for d in grp_idx:
+                        for t in range(self._n_low_freq, self._n_keep_coeffs):
+                            parts.append(self._encode_coeff(coeffs[t, d], pct, tokens))
+
+        # ===== 旋转: 四元数 → 欧拉角 (逐帧), 均匀分桶 360 bin (时域, 不做 DCT) =====
+        # 四元数有单位约束/双覆盖/非线性叠加, 不适合频域分析, 退回时域分桶,
+        # 与 PoseStateTokenizer.rot 完全一致。
         if len(q_idx) >= 4:
             # 统一成 (qw, qx, qy, qz) 索引, 兼容 xyzw / wxyz 两种顺序
             if quat_order == "wxyz":
                 iw, ix, iy, iz = (q_idx[0], q_idx[1], q_idx[2], q_idx[3])
             else:  # xyzw
                 ix, iy, iz, iw = (q_idx[0], q_idx[1], q_idx[2], q_idx[3])
-            # 逐帧转换: (T,) × 4 → (T, 3)
-            qw, qx, qy, qz = state[:, iw], state[:, ix], state[:, iy], state[:, iz]
-            roll = np.arctan2(2 * (qw * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy))
-            pitch = np.arcsin(np.clip(2 * (qw * qy - qz * qx), -1.0, 1.0))
-            yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
-            euler = np.stack([roll, pitch, yaw], axis=-1)  # (T, 3)
-
-            # 重构 state: 保留非四元数维度 + 拼接欧拉角, 舍弃四元数原始分量
-            # 例: [x, y, z, qx, qy, qz, qw] → [x, y, z, roll, pitch, yaw]  (7 → 6 维)
-            keep_idx = [i for i in range(D) if i not in q_idx]
-            state = np.concatenate([state[:, keep_idx], euler], axis=-1)
-            # 重新设定分组索引: 平移保持原位, 旋转(欧拉角)接在后面
-            n_xy = len(xy_idx)
-            n_z = len(z_idx)
-            xy_idx = list(range(n_xy))
-            z_idx = [n_xy] if n_z else []
-            rpy_idx = list(range(n_xy + n_z, n_xy + n_z + 3))
-            D = state.shape[1]
-        else:
-            rpy_idx = []
-
-        # 时间轴 DCT (type-II 正变换, orthogonally normalized)
-        # coeffs[t, d] 是第 d 维的第 t 个频率分量; t=0 为直流分量。
-        def _dct_axis0(x: np.ndarray) -> np.ndarray:
-            return dct(x, type=2, norm="ortho", axis=0)
-
-        coeffs = _dct_axis0(state)  # (T, D)
-
-        parts: list[str] = []
-        # --- 低频系数: 稠密 2048 bin ---
-        for grp_idx, pct, tokens in (
-            (xy_idx, self.pct_low_xy, self.LOW_XY_TOKENS),
-            (z_idx, self.pct_low_z, self.LOW_Z_TOKENS),
-            (rpy_idx, self.pct_low_q, self.LOW_Q_TOKENS),
-        ):
-            for d in grp_idx:
-                if d >= D:
-                    continue
-                for t in range(self._n_low_freq):
-                    parts.append(self._encode_coeff(coeffs[t, d], pct, tokens))
-        # --- 高频系数: 稀疏 360 bin ---
-        for grp_idx, pct, tokens in (
-            (xy_idx, self.pct_high_xy, self.HIGH_XY_TOKENS),
-            (z_idx, self.pct_high_z, self.HIGH_Z_TOKENS),
-            (rpy_idx, self.pct_high_q, self.HIGH_Q_TOKENS),
-        ):
-            for d in grp_idx:
-                if d >= D:
-                    continue
-                for t in range(self._n_low_freq, T):
-                    parts.append(self._encode_coeff(coeffs[t, d], pct, tokens))
+            for t in range(T):
+                qw, qx, qy, qz = state[t, iw], state[t, ix], state[t, iy], state[t, iz]
+                euler = self._quaternion_to_euler(qw, qx, qy, qz)
+                rot_bins = ((euler + np.pi) / (2 * np.pi) * (self.ROT_BINS - 1)).astype(int)
+                rot_bins = np.clip(rot_bins, 0, self.ROT_BINS - 1)
+                for b in rot_bins:
+                    parts.append(self.ROT_TOKENS[int(b)])
 
         return "".join(parts)
 
@@ -573,10 +572,9 @@ class PoseDCTTokenizer:
         return (
             self.LOW_XY_TOKENS
             + self.LOW_Z_TOKENS
-            + self.LOW_Q_TOKENS
             + self.HIGH_XY_TOKENS
             + self.HIGH_Z_TOKENS
-            + self.HIGH_Q_TOKENS
+            + self.ROT_TOKENS
         )
 
     @property

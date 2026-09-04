@@ -100,6 +100,17 @@ class PiperInputs(transforms.DataTransformFn):
     # deque 自然累积密集序列。
     dct_state_window: int = 0
 
+    # 是否给 state 主干拼接历史帧。默认 True (Piper 行为: 按 history_offsets 下采样多帧
+    # 拼到主干, 配合 DCT 时主干仍保留 2 秒跨度语义)。设为 False 时 state 主干只取当前帧,
+    # history_offsets 仅用于图像 history 拼接 + DCT 密集窗口——适用于 "只加图像 history"
+    # 的场景 (如 Realman DCT: state 已由 DCT 频域编码, 主干无需再拼历史)。
+    state_history: bool = True
+
+    # 是否给图像拼接历史帧 (mosaic)。设为 False 时图像只用当前帧 (单帧输入),
+    # history_offsets 仅作用于 state 主干 + DCT 密集窗口 —— 用于消融实验
+    # (state history vs image history 的贡献分离)。
+    image_history: bool = True
+
     _history_buffers: dict[str, deque[np.ndarray]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -134,7 +145,12 @@ class PiperInputs(transforms.DataTransformFn):
             self._history_buffers[key] = deque((frame.copy() for frame in frames), maxlen=buf_size)
             if is_state and self.history_offsets and self.dct_state_window > 0:
                 # 按 offsets 下采样主干帧 (offset 0 = 最后一帧 = 当前帧)
-                return [frames[-1 + off] for off in self.history_offsets]
+                if self.state_history:
+                    return [frames[-1 + off] for off in self.history_offsets]
+                # state_history=False: 主干只取当前帧, offsets 仅服务图像 history + DCT
+                return [frames[-1]]
+            if is_state and not self.state_history:
+                return [frames[-1]]
             return frames[-self.history_length:] if is_state and len(frames) > self.history_length else frames
         if value.ndim != base_ndim:
             raise ValueError(
@@ -145,13 +161,18 @@ class PiperInputs(transforms.DataTransformFn):
         buffer.append(value.copy())
         frames = list(buffer)
         if is_state and self.history_offsets and self.dct_state_window > 0:
-            # 推理: 按 offsets 相对 deque 末尾索引, 不足时用首帧补齐
-            result = []
-            for off in self.history_offsets:
-                idx = len(frames) - 1 + off
-                result.append(frames[idx] if idx >= 0 else frames[0])
-            return result
+            if self.state_history:
+                # 推理: 按 offsets 相对 deque 末尾索引, 不足时用首帧补齐
+                result = []
+                for off in self.history_offsets:
+                    idx = len(frames) - 1 + off
+                    result.append(frames[idx] if idx >= 0 else frames[0])
+                return result
+            # state_history=False: 主干只取当前帧 (deque 仍累积供 DCT 取最近 N 帧)
+            return [frames[-1]]
         # 主干只取最近 history_length 帧 (从旧到新); 多余帧保留在 deque 供 DCT 使用
+        if is_state and not self.state_history:
+            return [frames[-1]]
         if is_state and len(frames) > self.history_length:
             frames = frames[-self.history_length :]
         return [frames[0]] * (self.history_length - len(frames)) + frames
@@ -211,6 +232,10 @@ class PiperInputs(transforms.DataTransformFn):
             data["observation/wrist_image"],
             PIPER_HISTORY_INPUT_SPECS["observation/wrist_image"],
         )
+        if not self.image_history:
+            # 消融: 图像只用当前帧 (最后一帧)
+            base_history = [base_history[-1]]
+            wrist_history = [wrist_history[-1]]
         base_image = _make_history_mosaic([_parse_image(frame) for frame in base_history])
         wrist_image = _make_history_mosaic([_parse_image(frame) for frame in wrist_history])
         # 数据集可能没有第三路图像 (target)。有则作为 right_wrist, 无则用零填充并 mask 掉。

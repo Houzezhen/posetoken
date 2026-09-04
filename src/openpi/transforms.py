@@ -135,7 +135,15 @@ class Normalize(DataTransformFn):
         )
 
     def _normalize(self, x, stats: NormStats):
-        mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
+        # 与 _unnormalize 对称: 当 stats 维度 < x 维度时 (例如 PiperInputs 已把
+        # state/actions pad 到 model action_dim=32, 但 norm_stats 只覆盖原始 7 维),
+        # 只归一化 stats 覆盖的前缀维度, 多出的 padding 维度原样透传 (保持 0)。
+        # 当 stats 维度 >= x 维度时, 行为与原先的切片写法一致 (取前 x 维)。
+        dim = min(stats.mean.shape[-1], x.shape[-1])
+        mean = stats.mean[..., :dim]
+        std = stats.std[..., :dim]
+        if dim < x.shape[-1]:
+            return np.concatenate([(x[..., :dim] - mean) / (std + 1e-6), x[..., dim:]], axis=-1)
         return (x - mean) / (std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):

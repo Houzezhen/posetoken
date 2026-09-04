@@ -83,6 +83,9 @@ class Pi0(_model.BaseModel):
                 config.bin_stats_path,
                 dct_window_size=config.dct_window_size,
                 n_low_freq=config.dct_n_low_freq,
+                n_keep_coeffs=config.dct_n_keep_coeffs,
+                low_freq_bins=config.dct_low_bins,
+                high_freq_bins=config.dct_high_bins,
                 state_dim=config.dct_state_dim,
             )
             extra_vocab_size = pose_tok.num_special_tokens
