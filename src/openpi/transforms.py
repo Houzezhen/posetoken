@@ -265,6 +265,11 @@ class TokenizePrompt(DataTransformFn):
         # 如果存在, 优先用它做频域编码; 否则回退到单帧 state (兼容老路径)。
         state_dct = data.pop("state_dct", None)
 
+        # motion (可选): PiperInputs 提供的 6D 相对运动, 由 motion_tokenizer 编码为
+        # 独立的 Motion token 段插入序列 (不会拼到 state 后面)。
+        # 用 get 而非 pop, 保留 motion 供下游 Observation.from_dict 读取。
+        motion = data.get("motion")
+
         if self.discrete_state_input:
             if (state := data.get("state", None)) is None and state_dct is None:
                 raise ValueError("State is required.")
@@ -274,7 +279,7 @@ class TokenizePrompt(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt, state, state_dct=state_dct)
+        tokens, token_masks = self.tokenizer.tokenize(prompt, state, state_dct=state_dct, motion=motion)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 

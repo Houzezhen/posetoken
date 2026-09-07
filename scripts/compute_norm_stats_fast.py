@@ -19,6 +19,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 import openpi.models.model as _model
+import openpi.policies.piper_policy as piper_policy
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 
@@ -52,6 +53,20 @@ def main():
     state = np.concatenate(state_all).astype(np.float64)
     action = np.concatenate(action_all).astype(np.float64)
 
+    # 计算 motion (相邻帧差分: Δxyz + 相对旋转向量), 与 PiperInputs 的训练管线一致。
+    # Realman 数据集四元数为 wxyz, Piper 为 xyzw, 由 config.data.quat_order 决定。
+    quat_order = getattr(config.data, "quat_order", "xyzw")
+    motion_all = []
+    for s in state_all:
+        if s.shape[0] >= 2:
+            m = np.stack(
+                [piper_policy._relative_motion(s[i], s[i + 1], quat_order=quat_order) for i in range(s.shape[0] - 1)]
+            )
+        else:
+            m = np.zeros((0, piper_policy.PIPER_MOTION_DIM), dtype=np.float64)
+        motion_all.append(m)
+    motion = np.concatenate(motion_all).astype(np.float64)
+
     # 若 data_transforms 含 DeltaActions, 统计作用在 delta 之后 (与训练管线一致:
     # repack -> data_transforms(Delta) -> Normalize)。action[t]-state[t] 近似
     # chunk 首帧对齐的 delta (action[t]=state[t+1], chunk 首帧差一帧, 可忽略)。
@@ -74,7 +89,7 @@ def main():
         q01, q99 = quantiles(arr)
         return normalize.NormStats(mean=mean, std=std, q01=q01, q99=q99)
 
-    norm_stats = {"state": stats_of(state), "actions": stats_of(action)}
+    norm_stats = {"state": stats_of(state), "actions": stats_of(action), "motion": stats_of(motion)}
 
     output_path = config.assets_dirs / repo
     print(f"Writing stats to: {output_path}")

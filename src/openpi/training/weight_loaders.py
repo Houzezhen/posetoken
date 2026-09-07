@@ -129,18 +129,18 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
         if k not in result:
             result[k] = flat_ref[k]
 
-    # ===== Pose Token: checkpoint 缺失独立 pose 表 → 保留 ref 结构占位 =====
-    # 拆分方案下 pose_embedding 是新参数, 预训练/旧 checkpoint 中不存在。
-    # 这里用 ref (通常为 ShapeDtypeStruct) 占位保证结构与模型一致; 训练代码
-    # 后续会移除占位并回退到 train_state 的随机初始化 (pose 表不被冻结, 可正常训练)。
+    # ===== 新增参数: checkpoint 缺失时用 ref 占位 (保留随机初始化) =====
+    # pose_embedding 和 motion_proj 都是后加的独立参数, 预训练/旧 checkpoint 中不存在。
+    # 用 ref (通常为 ShapeDtypeStruct) 占位保证结构与模型一致; 训练代码
+    # 后续会移除占位并回退到 train_state 的随机初始化 (这些参数不被冻结, 可正常训练)。
     for k, ref_v in flat_ref.items():
         if k in result:
             continue
         k_str = "/".join(k) if isinstance(k, tuple) else str(k)
-        if "pose_embedding" in k_str:
+        if "pose_embedding" in k_str or "motion_proj" in k_str:
             result[k] = ref_v
             logger.info(
-                "[weight loader] Pose embedding '%s' missing from checkpoint; using train-state init (%s)",
+                "[weight loader] New param '%s' missing from checkpoint; using train-state init (%s)",
                 k_str,
                 getattr(ref_v, "shape", None),
             )

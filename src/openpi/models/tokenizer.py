@@ -19,6 +19,7 @@ class PaligemmaTokenizer:
         pose_split: dict | None = None,
         dct_tokenizer=None,
         dct_state_dim: int = 7,
+        motion_tokenizer=None,
     ):
         """
         Args:
@@ -29,12 +30,15 @@ class PaligemmaTokenizer:
             dct_tokenizer: 可选的 PoseDCTTokenizer 实例 (pose_token_dct 分支)。
                           若提供, 优先于 pose_tokenizer, 对 state 时间序列做 DCT 频域分桶。
             dct_state_dim: DCT 编码时单帧 state 维度 (默认 7), 用于把一维堆叠重塑为 (T, D)。
+            motion_tokenizer: 可选的 MotionTokenizer 实例。若提供且传入 motion, 则在
+                              State 之后、Action 之前插入独立的 Motion token 段。
         """
         self._max_len = max_len
         self._pose_tokenizer = pose_tokenizer
         self._pose_split = pose_split
         self._dct_tokenizer = dct_tokenizer
         self._dct_state_dim = int(dct_state_dim)
+        self._motion_tokenizer = motion_tokenizer
 
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
@@ -46,8 +50,18 @@ class PaligemmaTokenizer:
         state: np.ndarray | None = None,
         *,
         state_dct: np.ndarray | None = None,
+        motion: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        # Motion 段 (仅在启用 motion tokenizer 时使用): 作为独立 token 序列插入 State 与 Action 之间,
+        # 不把 6D motion 数值拼到 state 后面。
+        motion_segment = []
+        if motion is not None and self._motion_tokenizer is not None:
+            motion_prefix = self._tokenizer.encode(", Motion: ")
+            motion_token_str = self._motion_tokenizer.encode_state(motion)
+            motion_tokens = self._motion_tokenizer.encode_to_ids(motion_token_str)
+            motion_segment = motion_prefix + motion_tokens
+
         # DCT 只接受显式传入的密集连续序列 (state_dct); 没有 state_dct 时
         # 绝不把主干拼接 state 误当序列做 DCT
         if state_dct is not None and self._dct_tokenizer is not None:
@@ -57,7 +71,7 @@ class PaligemmaTokenizer:
             state_token_str = self._dct_tokenizer.encode_state(state_dct, self._pose_split)
             pose_tokens = self._dct_tokenizer.encode_to_ids(state_token_str)
             suffix_tokens = self._tokenizer.encode(";\nAction: ")
-            tokens = prefix_tokens + pose_tokens + suffix_tokens
+            tokens = prefix_tokens + pose_tokens + motion_segment + suffix_tokens
         elif state is not None and self._pose_tokenizer is not None:
             # ===== Pose Token 编码路径 (时域单帧) =====
             prefix_str = f"Task: {cleaned_text}, State: "
@@ -65,7 +79,7 @@ class PaligemmaTokenizer:
             state_token_str = self._pose_tokenizer.encode_state(state, self._pose_split)
             pose_tokens = self._pose_tokenizer.encode_to_ids(state_token_str)
             suffix_tokens = self._tokenizer.encode(";\nAction: ")
-            tokens = prefix_tokens + pose_tokens + suffix_tokens
+            tokens = prefix_tokens + pose_tokens + motion_segment + suffix_tokens
         elif state is not None:
             # ===== 原生 π0.5 逻辑 (保留兼容) =====
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
@@ -75,6 +89,7 @@ class PaligemmaTokenizer:
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
             tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
+
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
             padding = [False] * (self._max_len - tokens_len)

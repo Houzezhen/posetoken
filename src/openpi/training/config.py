@@ -206,6 +206,30 @@ class ModelTransformFactory(GroupFactory):
                     )
                 # ======================================
 
+                # ===== 条件创建 MotionTokenizer =====
+                # base_vocab_size 从 pose/dct tokenizer 的 extended_vocab_size 开始,
+                # 避免 motion token ID 与 pose token ID 冲突。
+                motion_tok = None
+                if getattr(model_config, "use_motion_token", False):
+                    from openpi.models.pose_tokenizer import MotionTokenizer
+
+                    motion_base = (dct_tok or pose_tok).extended_vocab_size if (dct_tok or pose_tok) else None
+                    if motion_base is None:
+                        motion_base = 257152  # PaliGemma 原始词表大小
+                    motion_tok = MotionTokenizer(
+                        base_vocab_size=motion_base,
+                        num_bins=model_config.motion_bins,
+                        motion_range=model_config.motion_range,
+                    )
+                    logging.info(
+                        "Motion token enabled: %d extra tokens (bins=%d, range=%.4f, base_vocab=%d)",
+                        motion_tok.num_special_tokens,
+                        model_config.motion_bins,
+                        model_config.motion_range,
+                        motion_base,
+                    )
+                # ======================================
+
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -217,6 +241,7 @@ class ModelTransformFactory(GroupFactory):
                                 pose_split=pose_split,
                                 dct_tokenizer=dct_tok,
                                 dct_state_dim=model_config.dct_state_dim,
+                                motion_tokenizer=motion_tok,
                             ),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
@@ -467,6 +492,13 @@ class LeRobotPiperDataConfig(DataConfigFactory):
     # 不对图像列做稀疏 history 采样 (省 IO), 图像只用当前帧 —— 用于消融实验。
     image_history: bool = True
 
+    # 四元数顺序 (透传给 PiperInputs.quat_order): "xyzw" 或 "wxyz"。
+    quat_order: str = "xyzw"
+
+    # motion 差分跨度 (透传给 PiperInputs.motion_offset)。1 = 相邻帧差分;
+    # 20 = 与 20 帧前 (约 0.67s @30Hz) 差分。
+    motion_offset: int = 1
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         if not self.history_offsets or self.history_offsets[-1] != 0:
@@ -513,6 +545,8 @@ class LeRobotPiperDataConfig(DataConfigFactory):
                     dct_state_window=int(getattr(model_config, "dct_state_window", 0) or 0),
                     state_history=self.state_history,
                     image_history=self.image_history,
+                    quat_order=self.quat_order,
+                    motion_offset=self.motion_offset,
                 )
             ],
             outputs=[piper_policy.PiperOutputs()],
@@ -570,6 +604,11 @@ class LeRobotPiperDataConfig(DataConfigFactory):
 class LeRobotRealmanDataConfig(LeRobotPiperDataConfig):
     """Realman ECO63F 数据集 (liftseat): cam_bottom 为主视角, cam_wrist 为腕部。
     cam_top 不参与训练。位姿为相机系 7 维绝对位姿 (无 delta)。"""
+
+    # Realman 数据集 state/action 为 [x,y,z,qw,qx,qy,qz] (wxyz 四元数顺序)。
+    quat_order: str = "wxyz"
+    # motion 与 20 帧前差分 (约 0.67s @30Hz), 比相邻帧差分信噪比更高。
+    motion_offset: int = 20
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -1454,6 +1493,56 @@ _CONFIGS = [
         save_interval=5000,
         keep_period=10,
         num_train_steps=15_001,
+        num_workers=8,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # ============================================================================================
+
+    ### pi05 used for Realman ECO63F + 时域 Pose Token + 历史帧 (非 DCT 对照) ------------------
+    # 对照 pi05_piper_pose_history (Piper + PoseStateTokenizer + 历史帧) 的 Realman 版本:
+    #   - use_pose_state_encoding=True: 非均匀分桶 (transXY/transZ 2048 bins) + 欧拉角 360 bins
+    #   - 图像 4 帧 mosaic (PIPER_HISTORY_OFFSETS), state 主干拼 4 帧历史
+    #   - 无 DCT: pose token 只编码当前帧 state
+    # 使用前需先运行:
+    #   python scripts/compute_pose_bin_stats.py \
+    #     --data-dir=/media/Data/user/datasets/realman/liftseat_0819_0820_merged_v2.1_cut_camframe/data \
+    #     --output=./bin_stats_realman_liftseat.pkl
+    TrainConfig(
+        name="pi05_realman_pose_token_history",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            use_pose_state_encoding=True,
+            bin_stats_path="/home/user/pi05_poseToken/bin_stats_realman_liftseat.pkl",
+            pose_split={"trans_xyz": [0, 1, 2], "quat_wxyz": [3, 4, 5, 6], "other": []},
+        ),
+        data=LeRobotRealmanDataConfig(
+            repo_id="/media/Data/user/datasets/realman/liftseat_0819_0820_merged_v2.1_cut_camframe",
+            history_offsets=piper_policy.PIPER_HISTORY_OFFSETS,
+            state_history=True,
+            image_history=True,
+            base_config=DataConfig(
+                action_sequence_keys=("action",),
+                prompt_from_task=True),
+        ),
+        # 从 piper 非 DCT pose token 预训练 checkpoint 恢复 (embedding 会自动扩展, pose 表均值初始化)
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/user/pi05_poseToken/checkpoints/pi05_piper_pose_history/pose_token_camera/20000/params"
+        ),
+        policy_metadata={
+            "observation_history": {
+                "length": len(piper_policy.PIPER_HISTORY_OFFSETS),
+                "input_specs": piper_policy.PIPER_HISTORY_INPUT_SPECS,
+                "stride_frames": piper_policy.PIPER_HISTORY_STRIDE_FRAMES,
+                "offsets": piper_policy.PIPER_HISTORY_OFFSETS,
+            }
+        },
+        save_interval=5000,
+        keep_period=10,
+        num_train_steps=30_001,
         num_workers=8,
         freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"

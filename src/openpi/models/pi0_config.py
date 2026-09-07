@@ -71,6 +71,16 @@ class Pi0Config(_model.BaseModelConfig):
     dct_state_dim: int = 7
     # ==================================================
 
+    # ===== Motion token 配置 =====
+    # 是否在 token 序列中插入独立的 Motion token (6D 相对运动离散化)。
+    # 启用后序列变为: Task + State + Motion -> Action, 不把 motion 拼到 state 后面。
+    use_motion_token: bool = False
+    # 每个 motion 维度的均匀分桶数。
+    motion_bins: int = 256
+    # motion 均匀分桶的值域 [-motion_range, motion_range]。
+    motion_range: float = 1.0
+    # ==============================
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -87,6 +97,17 @@ class Pi0Config(_model.BaseModelConfig):
         # 启用 Pose Token 编码时, 强制 discrete_state_input=True 并增大 max_token_len
         elif self.use_pose_state_encoding:
             object.__setattr__(self, "discrete_state_input", True)
+            if self.max_token_len < 300:
+                object.__setattr__(self, "max_token_len", 300)
+
+        # 启用 Motion token 时, 强制 discrete_state_input=True (motion 作为离散 token 进序列)
+        if self.use_motion_token:
+            if not (self.use_pose_state_encoding or self.use_dct_pose_encoding):
+                raise ValueError(
+                    "use_motion_token 需要配合 use_pose_state_encoding 或 use_dct_pose_encoding 使用"
+                )
+            object.__setattr__(self, "discrete_state_input", True)
+            # Motion 段额外约 10 token (标签 + 6 个分桶 token), 预留上界。
             if self.max_token_len < 300:
                 object.__setattr__(self, "max_token_len", 300)
 
@@ -121,6 +142,7 @@ class Pi0Config(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                motion=jax.ShapeDtypeStruct([batch_size, 6], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )

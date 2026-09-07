@@ -25,7 +25,38 @@ PIPER_HISTORY_INPUT_SPECS = {
     "observation/wrist_image": 3,
 }
 PIPER_HISTORY_STATE_DIM = 7
+PIPER_MOTION_DIM = 6
 
+
+def _relative_motion(previous: np.ndarray | None, current: np.ndarray, *, quat_order: str = "xyzw") -> np.ndarray:
+    if previous is None:
+        return np.zeros(PIPER_MOTION_DIM, dtype=np.float32)
+    previous = np.ravel(previous)[:PIPER_HISTORY_STATE_DIM]
+    current = np.ravel(current)[:PIPER_HISTORY_STATE_DIM]
+    delta_xyz = current[:3] - previous[:3]
+    q0 = np.asarray(previous[3:7], dtype=np.float32)
+    q1 = np.asarray(current[3:7], dtype=np.float32)
+    # Realman 数据集四元数顺序为 wxyz [w,x,y,z], 统一转成 xyzw [x,y,z,w] 再计算相对旋转。
+    if quat_order == "wxyz":
+        q0 = q0[[1, 2, 3, 0]]
+        q1 = q1[[1, 2, 3, 0]]
+    q0 = q0 / max(np.linalg.norm(q0), 1e-8)
+    q1 = q1 / max(np.linalg.norm(q1), 1e-8)
+    q0_inv = np.array([-q0[0], -q0[1], -q0[2], q0[3]])
+    q = np.array([
+        q1[3] * q0_inv[0] + q1[0] * q0_inv[3] + q1[1] * q0_inv[2] - q1[2] * q0_inv[1],
+        q1[3] * q0_inv[1] - q1[0] * q0_inv[2] + q1[1] * q0_inv[3] + q1[2] * q0_inv[0],
+        q1[3] * q0_inv[2] + q1[0] * q0_inv[1] - q1[1] * q0_inv[0] + q1[2] * q0_inv[3],
+        q1[3] * q0_inv[3] - q1[0] * q0_inv[0] - q1[1] * q0_inv[1] - q1[2] * q0_inv[2],
+    ])
+    if q[3] < 0:
+        q = -q
+    xyz_norm = np.linalg.norm(q[:3])
+    if xyz_norm < 1e-8:
+        rotvec = 2.0 * q[:3]
+    else:
+        rotvec = 2.0 * np.arctan2(xyz_norm, np.clip(q[3], -1.0, 1.0)) * q[:3] / xyz_norm
+    return np.concatenate((delta_xyz, rotvec)).astype(np.float32)
 
 def make_libero_example() -> dict:
     """Creates a random input example for the Libero policy."""
@@ -111,6 +142,14 @@ class PiperInputs(transforms.DataTransformFn):
     # (state history vs image history 的贡献分离)。
     image_history: bool = True
 
+    # 四元数顺序: "xyzw" (Piper 数据集) 或 "wxyz" (Realman 数据集)。
+    # 用于计算相对旋转向量 (motion 的 rotvec 部分)。
+    quat_order: str = "xyzw"
+
+    # motion 差分跨度 (帧数)。1 = 上一帧; 20 = 20 帧前 (约 0.67s @30Hz)。
+    # 训练时从密集 state 序列取, 推理时从 history deque 取, 不足时置零。
+    motion_offset: int = 1
+
     _history_buffers: dict[str, deque[np.ndarray]] = dataclasses.field(
         default_factory=dict, init=False, repr=False, compare=False
     )
@@ -186,9 +225,21 @@ class PiperInputs(transforms.DataTransformFn):
         # since the pi0-FAST action_dim = 7, which is < state_dim = 8, so pad is skipped.
         # Keep this for your own dataset, but if your dataset stores the proprioceptive input
         # in a different key than "observation/state", you should change it below.
+        # Compute motion between the current state and the frame motion_offset earlier
+        # (default: previous frame; e.g. 20 frames ≈ 0.67s @30Hz), before updating the buffer.
+        raw_state = np.asarray(data["observation/state"])
+        if raw_state.ndim == 2:
+            previous_state = raw_state[-1 - self.motion_offset] if raw_state.shape[0] > self.motion_offset else None
+        else:
+            state_buffer = self._history_buffers.get("observation/state")
+            previous_state = (
+                state_buffer[-self.motion_offset] if state_buffer and len(state_buffer) >= self.motion_offset else None
+            )
         state_history = self._history(
             "observation/state", data["observation/state"], PIPER_HISTORY_INPUT_SPECS["observation/state"]
         )
+        motion = _relative_motion(previous_state, state_history[-1], quat_order=self.quat_order)
+
         # The current state stays first so DeltaActions and AbsoluteActions keep
         # using the current TCP pose. Earlier states fill the remaining slots.
         state_frames = [np.ravel(frame) for frame in state_history]
@@ -249,6 +300,7 @@ class PiperInputs(transforms.DataTransformFn):
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
             "state": state,
+            "motion": motion,
             "image": {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,

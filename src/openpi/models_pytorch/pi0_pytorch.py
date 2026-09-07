@@ -113,31 +113,45 @@ class PI0Pytorch(nn.Module):
                 state_dim=config.dct_state_dim,
             )
             self._num_extra_tokens = self.pose_tokenizer.num_special_tokens
-            self._extend_embeddings()
-            logging.info(
-                "Extended embedding (DCT): %d → %d (+%d pose tokens)",
-                self.paligemma_with_expert.paligemma.language_model.model.embed_tokens.num_embeddings
-                - self._num_extra_tokens,
-                self.paligemma_with_expert.paligemma.language_model.model.embed_tokens.num_embeddings,
-                self._num_extra_tokens,
-            )
         elif getattr(config, "use_pose_state_encoding", False):
             from openpi.models.pose_tokenizer import PoseStateTokenizer
 
             self.pose_tokenizer = PoseStateTokenizer(config.bin_stats_path)
             self._num_extra_tokens = self.pose_tokenizer.num_special_tokens
+
+        # ===== Motion Token: 在 pose token 之后追加 motion token 的 embedding 空间 =====
+        self.motion_tokenizer = None
+        if getattr(config, "use_motion_token", False):
+            from openpi.models.pose_tokenizer import MotionTokenizer
+
+            motion_base = (
+                self.pose_tokenizer.extended_vocab_size
+                if self.pose_tokenizer is not None
+                else self.paligemma_with_expert.paligemma.language_model.model.embed_tokens.num_embeddings
+            )
+            self.motion_tokenizer = MotionTokenizer(
+                base_vocab_size=motion_base,
+                num_bins=config.motion_bins,
+                motion_range=config.motion_range,
+            )
+            self._num_extra_tokens += self.motion_tokenizer.num_special_tokens
+        # ==============================================
+
+        if self._num_extra_tokens > 0:
+            old_vocab = self.paligemma_with_expert.paligemma.language_model.model.embed_tokens.num_embeddings
             self._extend_embeddings()
             logging.info(
-                "Extended embedding: %d → %d (+%d pose tokens)",
-                self.paligemma_with_expert.paligemma.language_model.model.embed_tokens.num_embeddings
-                - self._num_extra_tokens,
+                "Extended embedding: %d → %d (+%d extra tokens: pose + motion)",
+                old_vocab,
                 self.paligemma_with_expert.paligemma.language_model.model.embed_tokens.num_embeddings,
                 self._num_extra_tokens,
             )
-        # ============================================
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
+
+        # 独立连续 motion token: 6D (Δxyz + 相对旋转向量) 投影到 action expert 宽度。
+        self.motion_proj = nn.Linear(6, action_expert_config.width)
 
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -267,6 +281,7 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
+            observation.motion,
         )
 
     def sample_noise(self, shape, device):
@@ -334,8 +349,8 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+    def embed_suffix(self, state, motion, noisy_actions, timestep):
+        """Embed state, motion, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -358,6 +373,26 @@ class PI0Pytorch(nn.Module):
             pad_masks.append(state_mask)
 
             # Set attention masks so that image and language inputs do not attend to state or actions
+            att_masks += [1]
+
+        if motion is not None:
+            if self.motion_proj.weight.dtype == torch.float32:
+                motion = motion.to(torch.float32)
+
+            # Embed motion as a single token
+            def motion_proj_func(motion):
+                return self.motion_proj(motion)
+
+            motion_emb = self._apply_checkpoint(motion_proj_func, motion)
+
+            embs.append(motion_emb[:, None, :])
+            bsize = motion_emb.shape[0]
+            device = motion_emb.device
+
+            motion_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+            pad_masks.append(motion_mask)
+
+            # image/language inputs do not attend to motion or actions
             att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
@@ -415,7 +450,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, motion = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -428,7 +463,7 @@ class PI0Pytorch(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, motion, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -480,7 +515,7 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, motion = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -507,6 +542,7 @@ class PI0Pytorch(nn.Module):
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
+                motion,
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
@@ -521,13 +557,14 @@ class PI0Pytorch(nn.Module):
     def denoise_step(
         self,
         state,
+        motion,
         prefix_pad_masks,
         past_key_values,
         x_t,
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, motion, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

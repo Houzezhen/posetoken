@@ -591,3 +591,105 @@ class PoseDCTTokenizer:
     def token_to_id(self) -> dict[str, int]:
         """token → ID 映射 (只读)"""
         return dict(self._token_to_id)
+
+
+class MotionTokenizer:
+    """将 6D 相对运动 (xyz 位移增量 + 相对旋转向量) 离散化为 Motion token。
+
+    motion 向量布局 (与 piper_policy._relative_motion 一致):
+        [dx, dy, dz, rx, ry, rz]
+          - dx/dy/dz: 平移增量
+          - rx/ry/rz: 相对旋转向量 (旋转轴 × 角度, 弧度)
+
+    与 PoseStateTokenizer 相同, 通过 > base_vocab_size 的整数 ID 绕过 SentencePiece。
+    6 个维度各自均匀分桶, 输出 6 个 token。base_vocab_size 通常传入 pose tokenizer
+    的 extended_vocab_size, 使 motion token ID 排在 pose token 之后, 避免 ID 冲突。
+    """
+
+    def __init__(
+        self,
+        base_vocab_size: int = BASE_VOCAB_SIZE,
+        num_bins: int = 256,
+        motion_range: float = 1.0,
+    ):
+        """
+        Args:
+            base_vocab_size: motion token ID 的起始值。通常传入 pose tokenizer 的
+                             extended_vocab_size, 使 motion token 与 pose token 不冲突。
+            num_bins: 每个维度的均匀分桶数。
+            motion_range: 均匀分桶的值域 [-motion_range, motion_range]。
+        """
+        self._base_vocab_size = int(base_vocab_size)
+        self._num_bins = int(num_bins)
+        self._range = float(motion_range)
+
+        self.MOTION_TOKENS = self._gen_tokens("mot", self._num_bins)
+        all_tokens = self.all_special_tokens
+        self._token_to_id = {tok: self._base_vocab_size + i for i, tok in enumerate(all_tokens)}
+        self._vocab_size = self._base_vocab_size + len(all_tokens)
+
+    @staticmethod
+    def _gen_tokens(prefix: str, num: int) -> list[str]:
+        """生成 token 字符串列表: <prefix000>, <prefix001>, ..."""
+        width = len(str(num - 1))
+        return [f"<{prefix}{str(i).zfill(width)}>" for i in range(num)]
+
+    def encode_state(self, motion: np.ndarray, motion_split: dict | None = None) -> str:
+        """将 6D motion 向量编码为 token 字符串。
+
+        Args:
+            motion: (6,) 或 (1, 6) 的 motion 向量 [dx, dy, dz, rx, ry, rz]。
+            motion_split: 保留参数, 与 pose tokenizer 接口对齐 (暂不使用)。
+
+        Returns:
+            token_str: 形如 "<mot012><mot128>..." 的 6 个 token 拼接字符串。
+        """
+        del motion_split  # 接口对齐, 暂不使用
+        motion = np.asarray(motion, dtype=np.float64).flatten()
+        if motion.shape[0] != 6:
+            raise ValueError(f"Motion must have 6 dims [dx, dy, dz, rx, ry, rz], got {motion.shape[0]}")
+
+        bins = np.linspace(-self._range, self._range, self._num_bins + 1, dtype=np.float64)
+        parts = []
+        for v in motion:
+            bin_idx = int(np.digitize(v, bins, right=False)) - 1
+            bin_idx = int(np.clip(bin_idx, 0, self._num_bins - 1))
+            parts.append(self.MOTION_TOKENS[bin_idx])
+        return "".join(parts)
+
+    def encode_to_ids(self, token_str: str) -> list[int]:
+        """将 motion token 字符串编码为 ID 序列 (与 pose tokenizer 相同的解析逻辑)。"""
+        ids = []
+        i = 0
+        while i < len(token_str):
+            if token_str[i] == "<":
+                end = token_str.find(">", i)
+                if end == -1:
+                    break
+                token = token_str[i : end + 1]
+                if token in self._token_to_id:
+                    ids.append(self._token_to_id[token])
+                    i = end + 1
+                    continue
+            i += 1
+        return ids
+
+    @property
+    def all_special_tokens(self) -> list[str]:
+        """返回所有需要注册的特殊 token"""
+        return self.MOTION_TOKENS
+
+    @property
+    def num_special_tokens(self) -> int:
+        """新增 token 数量"""
+        return len(self.all_special_tokens)
+
+    @property
+    def extended_vocab_size(self) -> int:
+        """扩展后的词表大小"""
+        return self._vocab_size
+
+    @property
+    def token_to_id(self) -> dict[str, int]:
+        """token → ID 映射 (只读)"""
+        return dict(self._token_to_id)

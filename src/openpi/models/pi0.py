@@ -108,6 +108,23 @@ class Pi0(_model.BaseModel):
                 extended_vocab_size,
                 pose_tok.num_special_tokens,
             )
+
+        # ===== Motion Token: 在 pose token 之后追加 motion token 的独立 embedding 空间 =====
+        if getattr(config, "use_motion_token", False):
+            from openpi.models.pose_tokenizer import MotionTokenizer
+
+            motion_tok = MotionTokenizer(
+                base_vocab_size=extended_vocab_size,
+                num_bins=config.motion_bins,
+                motion_range=config.motion_range,
+            )
+            extra_vocab_size += motion_tok.num_special_tokens
+            extended_vocab_size = motion_tok.extended_vocab_size
+            logger.info(
+                "Motion token enabled: extending vocab_size to %d (+%d motion tokens)",
+                extended_vocab_size,
+                motion_tok.num_special_tokens,
+            )
         # ==============================================
 
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -133,6 +150,13 @@ class Pi0(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)     # llm + img
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        # 独立连续 motion token: 6D (Δxyz + 相对旋转向量) 投影到 action expert 宽度。
+        # 仅在启用 use_motion_token 时创建, 以保持与旧 checkpoint 的参数结构兼容。
+        self.motion_proj = (
+            nnx.Linear(6, action_expert_config.width, rngs=rngs)
+            if getattr(config, "use_motion_token", False)
+            else None
+        )
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -197,6 +221,14 @@ class Pi0(_model.BaseModel):
             tokens.append(state_token)
             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
             # image/language inputs do not attend to state or actions
+            ar_mask += [True]
+
+        if obs.motion is not None and self.motion_proj is not None:
+            # add a single motion token (6D: Δxyz + relative rotation vector)
+            motion_token = self.motion_proj(obs.motion)[:, None, :]
+            tokens.append(motion_token)
+            input_mask.append(jnp.ones((obs.motion.shape[0], 1), dtype=jnp.bool_))
+            # image/language inputs do not attend to motion or actions
             ar_mask += [True]
 
         action_tokens = self.action_in_proj(noisy_actions)
