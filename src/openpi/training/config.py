@@ -1528,9 +1528,9 @@ _CONFIGS = [
                 action_sequence_keys=("action",),
                 prompt_from_task=True),
         ),
-        # 从 piper 非 DCT pose token 预训练 checkpoint 恢复 (embedding 会自动扩展, pose 表均值初始化)
+        # 从 pose_token_history 的 20000 步 checkpoint 微调
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/home/user/pi05_poseToken/checkpoints/pi05_piper_pose_history/pose_token_camera/20000/params"
+            "/home/user/pi05_poseToken/checkpoints/pi05_realman_pose_token_history/realman_pose_token_camera_base/20000/params"
         ),
         policy_metadata={
             "observation_history": {
